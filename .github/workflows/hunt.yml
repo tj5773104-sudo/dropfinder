@@ -1,0 +1,50 @@
+name: auto-hunt
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # every 6 hours
+  workflow_dispatch:
+    inputs:
+      sites:
+        description: "Random ranked sites to scan"
+        default: "300"
+      budget:
+        description: "Time budget (minutes)"
+        default: "40"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-hunt
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python dropfinder.py selftest
+      - name: Hunt
+        env:
+          OPR_API_KEY: ${{ secrets.OPR_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python dropfinder.py hunt \
+            --sites "${{ github.event.inputs.sites || '300' }}" \
+            --budget-minutes "${{ github.event.inputs.budget || '40' }}" \
+            --data data/candidates.json --csv data/latest.csv
+      - name: Commit results
+        run: |
+          git config user.name "dropfinder-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet && exit 0
+          git commit -m "auto-hunt $(date -u +'%Y-%m-%d %H:%M')"
+          for i in 1 2 3; do git pull --rebase -X theirs && git push && break; sleep 5; done
