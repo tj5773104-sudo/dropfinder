@@ -71,6 +71,11 @@ def load_feed():
             r["via"] = ",".join(sorted({s["via"] for s in srcs if s.get("via")}))
         if r.get("quality") is None:
             r["quality"], r["quality_reasons"] = df.quality_score(r)
+        if r.get("est_value") is None:
+            r["est_value"] = df.estimate_value(r)
+            r["reg_price"] = df.reg_price(r)
+            r["value_ratio"] = round(r["est_value"] / max(r["reg_price"], 1), 1)
+        r["wiki_only"] = df.wiki_only(r)
         auth = r.get("opr") if r.get("opr") is not None else r.get("cc_authority")
         r["authority"] = auth if auth not in ("", None) else None
     feed = {"updated": data.get("updated", ""), "runs": data.get("runs", [])[:10], "rows": rows}
@@ -332,6 +337,7 @@ select,input[type=text],input[type=number]{font:16px "Libre Franklin",system-ui,
 .PENDING_DELETE,.REDEMPTION,.EXPIRED_GRACE{background:var(--claretbg);color:var(--claret)}
 .meta{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:13px;color:var(--mute)}
 .meta b{color:var(--ink);font-weight:600}
+.val.good b{color:var(--teal)}
 .src{font-size:13px;border-top:1px solid var(--line);padding-top:8px;display:grid;gap:4px}
 .src .lbl{color:var(--mute);font-size:11px;font-weight:600}
 .src a{overflow-wrap:anywhere}
@@ -362,7 +368,7 @@ footer{color:var(--mute);font-size:12px;padding:20px 0 32px}
 
 {% if view == "feed" %}
 <div class="intro"><h1>Expired domains with <span>authority backlinks</span></h1>
-<p>Found automatically every few hours from strong backlink profiles, checked against registries and the Wayback Machine, scored 0-100.</p></div>
+<p>Found automatically every few hours from strong backlink profiles, closed organisations and old articles on top publishers; checked against registries and the Wayback Machine; scored for quality and value for money.</p></div>
 <div class="stats">
   <div class="stat"><b id="s-avail">-</b>available</div>
   <div class="stat"><b id="s-drop">-</b>dropping</div>
@@ -374,7 +380,7 @@ footer{color:var(--mute);font-size:12px;padding:20px 0 32px}
   <div class="row1">
     <div class="chips" id="chips"></div>
     <select id="sort" aria-label="Sort by">
-      <option value="quality">Best quality</option><option value="drops">Dropping soonest</option>
+      <option value="value">Best value for money</option><option value="quality">Best quality</option><option value="drops">Dropping soonest</option>
       <option value="ref_subnets">Most referring networks</option><option value="authority">Highest authority</option>
       <option value="real_years">Longest real history</option><option value="price">Cheapest</option><option value="domain">A-Z</option></select>
     <button type="button" class="ghost" id="moreBtn" aria-expanded="false" aria-controls="more">Filters</button>
@@ -385,8 +391,11 @@ footer{color:var(--mute);font-size:12px;padding:20px 0 32px}
     <select id="via" aria-label="Link source"><option value="">All sources</option><option value="stabledomains">Drop feed</option>
       <option value="majestic">Majestic Million</option><option value="commoncrawl">Top web graph</option><option value="hackernews">Hacker News</option>
       <option value="debian">Debian packages</option><option value="cordis">EU research projects</option>
+      <option value="wikidata">Closed organisations</option><option value="publishers">Top publishers</option>
       <option value="crawl">Ranked sites</option><option value="wikipedia">Wikipedia</option></select>
     <label>Min quality <input type="number" id="minscore" min="0" max="100" step="5" value="0"></label>
+    <label title="Estimated value divided by registration price">Worth at least <input type="number" id="minratio" min="0" max="100" step="1" value="3">× price</label>
+    <label><input type="checkbox" id="wikionly"> Include Wikipedia-only</label>
     <label><input type="checkbox" id="dfonly"> Dofollow only</label>
     <label><input type="checkbox" id="nospam" checked> Hide spammy</label>
     <a class="btn ghost" href="{{ url_for('feed_csv') }}">Download CSV</a>
@@ -448,7 +457,8 @@ Tap a source to open the linking page with the backlink highlighted. Register li
   const ORDER = {AVAILABLE:0,PENDING_DELETE:1,REDEMPTION:2,EXPIRED_GRACE:3,LIKELY_AVAILABLE:4,EXPIRING_SOON:5,PARKED:6,DEAD_SITE:7};
   const BUY = new Set(["AVAILABLE","LIKELY_AVAILABLE"]);
   const VIA = {hackernews:"Hacker News", debian:"Debian", cordis:"EU project", crawl:"ranked site", wikipedia:"Wikipedia",
-    stabledomains:"Drop feed", majestic:"Majestic Million", commoncrawl:"Top web graph"};
+    stabledomains:"Drop feed", majestic:"Majestic Million", commoncrawl:"Top web graph",
+    wikidata:"Closed organisation", publishers:"Top publisher"};
   const qClass = q => q >= 60 ? "qhi" : q >= 35 ? "qmid" : "qlo";
   const num = v => (v === null || v === undefined || v === "") ? null : Number(v);
   // open the linking page scrolled to the backlink, highlighted (#:~:text=)
@@ -467,6 +477,7 @@ Tap a source to open the linking page with the backlink highlighted. Register li
     const best = anchored.find(s => s.follow === "dofollow") || anchored[0] || src[0];
     const q = r.quality != null ? r.quality : null;
     const meta = [];
+    if (num(r.est_value)) meta.push(`<span class="${(r.value_ratio || 0) >= 3 ? "val good" : "val"}">est. <b>$${esc(Number(r.est_value).toLocaleString())}</b>${r.value_ratio ? ` (${esc(r.value_ratio)}× price)` : ""}</span>`);
     if (num(r.ref_subnets)) meta.push(`<span><b>${esc(Number(r.ref_subnets).toLocaleString())}</b> ref. networks</span>`);
     if (num(r.authority) !== null) meta.push(`<span>authority <b>${esc(r.authority)}</b>/10</span>`);
     if (num(r.real_years)) meta.push(`<span><b>${esc(r.real_years)}</b>y real site</span>`);
@@ -510,6 +521,7 @@ Tap a source to open the linking page with the backlink highlighted. Register li
   $("chips").innerHTML = Object.keys(GROUPS).map(g => `<button type="button" class="chip" aria-pressed="${DEFAULT_ON.includes(g)}" data-g="${g}">${g}</button>`).join("");
   DEFAULT_ON.forEach(g => GROUPS[g].forEach(s => status.add(s)));
   const SORTS = {
+    value: (a, b) => (b.value_ratio || 0) - (a.value_ratio || 0) || (b.quality || 0) - (a.quality || 0),
     quality: (a, b) => (b.quality || 0) - (a.quality || 0),
     drops: (a, b) => (a.expiry || "9999").localeCompare(b.expiry || "9999"),
     ref_subnets: (a, b) => (num(b.ref_subnets) || 0) - (num(a.ref_subnets) || 0),
@@ -526,17 +538,19 @@ Tap a source to open the linking page with the backlink highlighted. Register li
       && (!tl.length || tl.includes(r.domain.split(".").slice(1).join(".")) || tl.includes(r.domain.split(".").pop()))
       && (r.quality || 0) >= ms && (!$("dfonly").checked || r.dofollow_sources > 0)
       && (!$("nospam").checked || !(r.flags || "").includes("spam"))
-      && (!$("via").value || (r.via || "").split(",").includes($("via").value)))
+      && (!$("via").value || (r.via || "").split(",").includes($("via").value))
+      && (r.value_ratio || 0) >= (parseFloat($("minratio").value) || 0)
+      && ($("wikionly").checked || !r.wiki_only))
       .sort((a, b) => SORTS[$("sort").value](a, b) || (ORDER[a.status] ?? 9) - (ORDER[b.status] ?? 9));
     $("rows").innerHTML = rows.length ? rows.slice(0, shown).map(card).join("")
-      : `<div class="empty">${all.length ? "Nothing matches these filters." : "No finds yet - press Hunt now or wait for the next automatic hunt."}</div>`;
+      : `<div class="empty">${all.length ? "Nothing matches these filters. Try lowering \"Worth at least\" under Filters." : "No finds yet - press Hunt now or wait for the next automatic hunt."}</div>`;
     $("more2").hidden = rows.length <= shown;
     $("count").innerHTML = `Showing <b>${Math.min(rows.length, shown)}</b> of <b>${rows.length}</b> matching finds`;
   }
   $("chips").addEventListener("click", e => { const b = e.target.closest(".chip"); if (!b) return;
     const on = b.getAttribute("aria-pressed") !== "true"; b.setAttribute("aria-pressed", String(on));
     GROUPS[b.dataset.g].forEach(s => on ? status.add(s) : status.delete(s)); shown = 60; render(); });
-  ["q", "tld", "minscore", "dfonly", "nospam", "via", "sort"].forEach(id => ["input", "change"].forEach(ev =>
+  ["q", "tld", "minscore", "minratio", "wikionly", "dfonly", "nospam", "via", "sort"].forEach(id => ["input", "change"].forEach(ev =>
     $(id).addEventListener(ev, () => { shown = 60; render(); })));
   $("moreBtn").addEventListener("click", () => { const open = $("more").hidden; $("more").hidden = !open;
     $("moreBtn").setAttribute("aria-expanded", String(open)); $("moreBtn").textContent = open ? "Hide filters" : "Filters"; });

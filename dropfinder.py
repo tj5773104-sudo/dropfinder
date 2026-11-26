@@ -797,6 +797,9 @@ def quality_score(r):
         q += min(float(r["score"]), 10)
         if r.get("dofollow_sources"):
             reasons.append(f"{r['dofollow_sources']} dofollow linking site(s) found")
+    if "wikidata" in (r.get("via") or ""):
+        q += 8
+        reasons.append("official site of a closed organisation (Wikidata)")
     flags = r.get("flags") or ""
     if "spam" in flags:
         q -= 30
@@ -828,6 +831,151 @@ def graph_rows(candidates, via, info, stamp):
     return rows
 
 
+# ---- value: is it worth the registration fee? -------------------------------------------------------
+TLD_PRICE = {"com": 16.99, "net": 20.99, "org": 22.99, "io": 49.99, "co": 29.99, "info": 19.99, "uk": 9.99, "co.uk": 9.99}
+TLD_VALUE = {"com": 1.0, "net": 0.55, "org": 0.6, "io": 0.7, "co": 0.5, "co.uk": 0.6, "uk": 0.5, "de": 0.5, "ai": 0.9}
+
+
+def estimate_value(r):
+    """Rough resale/SEO value in USD from referring networks, real history, authority and the name itself.
+    StableDomains' own estimate wins when we have it."""
+    import math
+    if r.get("value_usd"):
+        return int(r["value_usd"])
+    d = r["domain"]
+    sld, _, tld = d.partition(".")
+    tl = TLD_VALUE.get(tld, 0.35)
+    n = len(sld)
+    ln = 1.8 if n <= 5 else 1.5 if n <= 7 else 1.2 if n <= 10 else 0.9 if n <= 14 else 0.6
+    subnets = float(r.get("ref_subnets") or 0)
+    real = float(r.get("real_years") or 0) or float(r.get("wb_years") or 0) * 0.5
+    auth = float(r.get("cc_authority") or r.get("opr") or 0)
+    links = float(r.get("dofollow_sources") or 0)
+    core = 8 + 1.1 * subnets + 5 * min(real, 20) + 35 * auth + 12 * min(links, 10)
+    flags = r.get("flags") or ""
+    m = 1.0
+    if "spam" in flags:
+        m *= 0.1
+    if r.get("parked_only"):
+        m *= 0.3
+    if re.search(r"\d", sld):
+        m *= 0.7
+    if "-" in sld:
+        m *= 0.6
+    return int(round(core * tl * ln * m / 5) * 5)
+
+
+def reg_price(r):
+    try:
+        return float(r.get("sd_price") or 0) or TLD_PRICE.get(r["domain"].partition(".")[2], 25.0)
+    except ValueError:
+        return TLD_PRICE.get(r["domain"].partition(".")[2], 25.0)
+
+
+def wiki_only(r):
+    """Only evidence is a Wikipedia citation (nofollow) - weak unless other signals back it up."""
+    vias = {v for v in (r.get("via") or "").split(",") if v}
+    return vias == {"wikipedia"} and not r.get("ref_subnets") and float(r.get("cc_authority") or 0) < 2
+
+
+# ---- defunct organisations (Wikidata) -------------------------------------------------------------
+WD_TYPES = {"Q11032": "newspaper", "Q41298": "magazine", "Q4830453": "business", "Q6881511": "enterprise",
+            "Q35127": "website", "Q163740": "nonprofit", "Q43229": "organization", "Q132241": "festival",
+            "Q2001305": "TV channel", "Q14350": "radio station", "Q18127": "record label", "Q1137109": "video game developer",
+            "Q215380": "band", "Q7275": "state agency", "Q327333": "government agency", "Q2085381": "publisher",
+            "Q1331793": "media company", "Q15265344": "broadcaster", "Q2385804": "educational institution",
+            "Q5633421": "scientific journal", "Q1002697": "periodical"}
+
+
+def wikidata_defunct(per_type=3000, types=None, session=None, rng=random, log=lambda m: None):
+    """Official websites of organisations Wikidata records as dissolved/closed (P576 + P856).
+    Their domains often lapse while news, .edu and .gov pages keep linking to them."""
+    s = session or requests.Session()
+    s.headers.update({"User-Agent": UA, "Accept": "application/sparql-results+json"})
+    out, seen = [], set()
+    for qid in (types or list(WD_TYPES)):
+        q = ("SELECT ?item ?itemLabel ?site ?end WHERE { ?item wdt:P31 wd:%s . ?item wdt:P856 ?site . "
+             "?item wdt:P576 ?end . SERVICE wikibase:label { bd:serviceParam wikibase:language \"en\" } } LIMIT %d"
+             % (qid, per_type))
+        try:
+            r = s.get("https://query.wikidata.org/sparql", params={"query": q, "format": "json"}, timeout=90)
+            rows = r.json()["results"]["bindings"]
+        except (requests.RequestException, ValueError, KeyError) as e:
+            log(f"  Wikidata {WD_TYPES.get(qid, qid)}: failed ({type(e).__name__})")
+            continue
+        n0 = len(out)
+        for b in rows:
+            site = b.get("site", {}).get("value", "")
+            label = b.get("itemLabel", {}).get("value", "")
+            end = b.get("end", {}).get("value", "")[:4]
+            item = b.get("item", {}).get("value", "")
+            rec = _rec(item, "wikidata.org", site, f"{label} (closed {end})" if end else label, "wikidata",
+                       follow="", reason=f"defunct {WD_TYPES.get(qid, '')}")
+            if rec and rec["target_domain"] not in seen:
+                seen.add(rec["target_domain"])
+                rec["defunct"] = WD_TYPES.get(qid, "")
+                out.append(rec)
+        log(f"  Wikidata defunct {WD_TYPES.get(qid, qid)}: {len(out) - n0} domains")
+        time.sleep(1.5)  # be gentle with the public endpoint
+    return out
+
+
+# ---- old articles on top publishers / government sites (via Wayback's URL index) ------------------
+AUTHORITY_SITES = [
+    # (url prefix whose OLD pages are still live, years to sample)
+    ("news.bbc.co.uk/2/hi/", (2002, 2011)), ("www.bbc.co.uk/news/", (2010, 2014)),
+    ("www.theguardian.com/technology/", (2009, 2014)), ("www.guardian.co.uk/technology/", (2005, 2010)),
+    ("www.nytimes.com/20", (2005, 2012)), ("www.forbes.com/sites/", (2011, 2015)),
+    ("www.wired.com/20", (2008, 2014)), ("techcrunch.com/20", (2007, 2013)), ("www.theverge.com/20", (2012, 2015)),
+    ("www.telegraph.co.uk/technology/", (2008, 2013)), ("www.independent.co.uk/life-style/gadgets-and-tech/", (2008, 2014)),
+    ("www.npr.org/templates/story/", (2004, 2012)), ("www.smithsonianmag.com/", (2008, 2014)),
+    ("www.nature.com/news/", (2008, 2014)), ("www.scientificamerican.com/article/", (2008, 2014)),
+    ("www.nasa.gov/", (2006, 2012)), ("www.loc.gov/", (2005, 2012)), ("www.nih.gov/news/", (2005, 2012)),
+    ("www.gov.uk/government/news/", (2012, 2015)), ("www.ed.gov/", (2005, 2012)), ("www.epa.gov/", (2005, 2012)),
+    ("www.mit.edu/", (2005, 2012)), ("news.mit.edu/20", (2010, 2014)), ("www.stanford.edu/", (2005, 2012)),
+    ("www.harvard.edu/", (2005, 2012)), ("www.ox.ac.uk/", (2005, 2012)), ("www.ucl.ac.uk/", (2005, 2012)),
+]
+
+
+def wayback_old_urls(prefix, years, limit=40, session=None, rng=random):
+    """Old article URLs under a prefix, from the Wayback Machine index (the live pages usually still exist)."""
+    s = session or requests.Session()
+    s.headers["User-Agent"] = UA
+    y = rng.randint(years[0], years[1])
+    try:
+        r = s.get("https://web.archive.org/cdx/search/cdx", timeout=60, params={
+            "url": prefix, "matchType": "prefix", "from": str(y), "to": str(y), "output": "json",
+            "fl": "original", "filter": ["statuscode:200", "mimetype:text/html"], "collapse": "urlkey",
+            "limit": "2000"})
+        rows = [x[0] for x in r.json()[1:]]
+    except (requests.RequestException, ValueError, IndexError):
+        return []
+    rows = [u for u in rows if not SKIP_EXT.search(u) and "?" not in u]
+    rng.shuffle(rows)
+    return rows[:limit]
+
+
+def authority_old_pages(sites=8, per_site=40, crawler=None, rng=random, log=lambda m: None):
+    """Dofollow outbound links on the OLD pages of top publishers and government/university sites."""
+    crawler = crawler or Crawler(delay=1.0)
+    picks = rng.sample(AUTHORITY_SITES, min(sites, len(AUTHORITY_SITES)))
+    out = []
+    sess = requests.Session()
+    for prefix, years in picks:
+        urls = wayback_old_urls(prefix, years, per_site, sess, rng)
+        n0 = len(out)
+        for u in urls:
+            if not u.startswith("http"):
+                u = "https://" + u.lstrip("/")
+            res = crawler.get(u)
+            if res:
+                for rec in extract_links(res[0], res[2], res[1])[0]:
+                    rec["via"] = "publishers"
+                    out.append(rec)
+        log(f"  {prefix}: {len(urls)} old pages, {len(out) - n0} outbound links")
+    return out
+
+
 # ---- verified dofollow niches -------------------------------------------------------------
 # Each of these was checked by hand: the outbound link carries no rel=nofollow/ugc/sponsored.
 CODE_HOSTS = {"sourceforge.net", "gitlab.com", "launchpad.net", "gnu.org", "nongnu.org", "pypi.org", "python.org",
@@ -840,7 +988,7 @@ CODE_HOSTS = {"sourceforge.net", "gitlab.com", "launchpad.net", "gnu.org", "nong
 
 
 VIA_BY_SOURCE = {"wikipedia.org": "wikipedia", "ycombinator.com": "hackernews", "debian.org": "debian",
-                 "europa.eu": "cordis", "github.com": "github"}
+                 "europa.eu": "cordis", "github.com": "github", "wikidata.org": "wikidata"}
 
 
 def infer_via(source_domain):
@@ -1198,14 +1346,15 @@ BUYABLE = {"AVAILABLE", "LIKELY_AVAILABLE"}
 
 # --------------------------------------------------------------------------- library api
 CSV_COLS = ["domain", "status", "quality", "score", "dofollow_sources", "nofollow_only_sources", "edu_gov_sources",
-            "best_source_rank", "ref_subnets", "real_years", "cc_authority", "cc_rank", "opr", "ref_domains", "via", "expiry", "dns", "site", "wb_first", "wb_last", "wb_years", "wb_months",
+            "best_source_rank", "est_value", "value_ratio", "ref_subnets", "real_years", "cc_authority", "cc_rank", "opr", "ref_domains", "via", "expiry", "dns", "site", "wb_first", "wb_last", "wb_years", "wb_months",
             "sd_available", "sd_price", "flags", "best_source_url", "best_anchor", "link_target_url", "buy_url",
             "more_sources", "first_seen", "last_checked"]
 
 
 def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categories=(), wiki_limit=300,
             github_query=None, github_limit=30, public_only=False, sitemaps=False, ranked_sites=(),
-            deadline=None, hn_months=0, debian_sample=0, cordis_sample=0, rng=random, log=lambda msg: None):
+            deadline=None, hn_months=0, debian_sample=0, cordis_sample=0, rng=random, wikidata_types=0,
+            publisher_sites=0, log=lambda msg: None):
     """Collect outbound link records from seeds, ranked sites' old pages, Wikipedia and GitHub."""
     crawler = Crawler(delay=delay, public_only=public_only, deadline=deadline)
     records = []
@@ -1267,6 +1416,25 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
                 recs = []
             log(f"  {len(recs)} dofollow links")
             records.extend(recs)
+    if publisher_sites and not crawler.expired():
+        log(f"Reading old articles on {publisher_sites} top publisher / government sites...")
+        try:
+            recs = authority_old_pages(publisher_sites, crawler=crawler, rng=rng, log=log)
+        except Exception as e:  # noqa: BLE001
+            log(f"  failed: {type(e).__name__}: {e}")
+            recs = []
+        log(f"  {len(recs)} links ({sum(r['follow'] == 'dofollow' for r in recs)} dofollow)")
+        records.extend(recs)
+    if wikidata_types:
+        log("Reading defunct organisations from Wikidata...")
+        types = rng.sample(list(WD_TYPES), min(wikidata_types, len(WD_TYPES)))
+        try:
+            recs = wikidata_defunct(types=types, rng=rng, log=log)
+        except Exception as e:  # noqa: BLE001
+            log(f"  failed: {type(e).__name__}: {e}")
+            recs = []
+        log(f"  {len(recs)} official websites of closed organisations")
+        records.extend(recs)
     if github_query:
         log(f"Searching GitHub for '{github_query}'...")
         try:
@@ -1473,7 +1641,8 @@ def graph_scan(pairs, info, log, label):
 def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_minutes=40, sites=100,
          wiki_months=2, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=6000,
          seed=None, hn_months=4, debian_sample=1500, cordis_sample=1500, cc_ranks=True,
-         sd_pages=40, majestic_batch=40000, cc_batch=40000, wayback_checks=150, log=print):
+         sd_pages=40, majestic_batch=40000, cc_batch=40000, wayback_checks=150, wikidata_types=8,
+         publisher_sites=8, log=print):
     """Fully automatic run.
     Authority-first: StableDomains quality drop feed, a rotating batch of the Majestic Million and of the
     Common Crawl ranking (DNS + registry checks), then link discovery (ranked sites, Hacker News, Debian,
@@ -1520,8 +1689,9 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     deadline = time.time() + budget_minutes * 60 * 0.3
     records = harvest(my_seeds, sitemaps=True, ranked_sites=ranked, wiki_categories=cats, wiki_limit=wiki_limit,
                       workers=workers, deadline=deadline, hn_months=hn_months, debian_sample=debian_sample,
-                      cordis_sample=cordis_sample, rng=rng, log=log)
-    for v in ("crawl", "wikipedia", "hackernews", "debian", "cordis"):
+                      cordis_sample=cordis_sample, rng=rng, wikidata_types=wikidata_types,
+                      publisher_sites=publisher_sites, log=log)
+    for v in ("crawl", "wikipedia", "hackernews", "debian", "cordis", "wikidata", "publishers"):
         by_source[v + "_links"] = sum(1 for r in records if r.get("via") == v)
     log(f"Harvested {len(records)} links ({sum(r['follow'] == 'dofollow' for r in records)} dofollow) "
         f"to {len({r['target_domain'] for r in records})} domains.")
@@ -1591,6 +1761,10 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
                 if h:
                     r.update({k: v for k, v in h.items() if v not in (None, "") or k in ("real_years",)})
     for r in old.values():
+        r["est_value"] = estimate_value(r)
+        r["reg_price"] = reg_price(r)
+        r["value_ratio"] = round(r["est_value"] / max(r["reg_price"], 1), 1)
+        r["wiki_only"] = wiki_only(r)
         if r.get("via") == "stabledomains" and r.get("quality") is not None and "real_years" not in r:
             continue  # StableDomains already scored it
         q, why = quality_score(r)
@@ -1661,6 +1835,7 @@ def cmd_hunt(a):
          os.environ.get("OPR_API_KEY"), a.workers, seed=a.random_seed, hn_months=a.hn_months,
          debian_sample=a.debian, cordis_sample=a.cordis, cc_ranks=not a.no_cc_ranks, sd_pages=a.sd_pages,
          majestic_batch=a.majestic, cc_batch=a.cc_batch, wayback_checks=a.wayback_checks,
+         wikidata_types=a.wikidata_types, publisher_sites=a.publishers,
          log=lambda m: print(m, flush=True))
 
 
@@ -1775,6 +1950,8 @@ def main():
     k.add_argument("--majestic", type=int, default=40000, help="Majestic Million domains to DNS-scan per run")
     k.add_argument("--cc-batch", type=int, default=40000, help="top Common Crawl domains to DNS-scan per run")
     k.add_argument("--wayback-checks", type=int, default=150, help="candidates to verify in the Wayback Machine")
+    k.add_argument("--wikidata-types", type=int, default=8, help="random kinds of defunct organisations to read")
+    k.add_argument("--publishers", type=int, default=8, help="top publisher / gov sites whose old pages to read")
     k.add_argument("--workers", type=int, default=24)
     k.add_argument("--random-seed", type=int)
     k.set_defaults(fn=cmd_hunt)
