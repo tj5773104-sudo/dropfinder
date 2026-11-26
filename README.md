@@ -5,16 +5,19 @@ Finds expired, dropping and available domains that still have backlinks from hig
 Live site: https://dropfinder.onrender.com
 
 ## How it finds domains (no input needed)
-1. **Ranked sites:** picks random sites from the Tranco top-1M list and reads their *oldest* pages via sitemaps
-   (old pages hold the most dead links).
-2. **Wikipedia:** mines random "Articles with dead external links from <month>" categories.
-3. **Your seeds (optional):** anything listed in `seeds.txt`.
-4. Every link is classified dofollow / nofollow, and each linking site gets an authority weight from its Tranco rank
-   (.edu/.gov boosted).
-5. Every linked-to domain is checked: DNS, then RDAP (available, pending delete, redemption, expired-in-grace).
-   Strongly linked domains that still resolve are visited to catch dead and parked sites.
-6. Available domains are confirmed with StableDomains (price + Register link with affiliate code), and Wayback
-   history gives domain age. Spammy names are flagged.
+Authority first - start from domains that already have strong backlink profiles, then find the dead ones:
+1. **StableDomains quality drop feed** - pending-delete / redemption / available domains already scored 0-100 from
+   Wayback real-site history, Majestic referring subnets and spam checks (free, paged).
+2. **Majestic Million** - the top 1M sites by referring subnets; a rotating batch is DNS + registry checked each run.
+3. **Common Crawl web graph** - a rotating window of the top-ranked domains (harmonic centrality) is checked the same way.
+
+Link discovery adds more (each link classified dofollow / nofollow):
+4. **Hacker News** front-page stories (100+ points, dofollow), **Debian** package homepages, **EU research project**
+   sites (CORDIS), the oldest/resource pages of Tranco-ranked sites, Wikipedia dead-link months, and `seeds.txt`.
+
+Every candidate gets: registry status (RDAP), a **Wayback real-site check** (sampled snapshots: real content vs
+parked/for-sale), Common Crawl **authority 0-10**, StableDomains price + Register link (affiliate), and a
+**Quality score 0-100** (real history, referring networks, authority, dofollow links, minus spam/parked).
 
 ## Automation
 `.github/workflows/hunt.yml` runs every 6 hours on GitHub Actions (free for public repos), merges results into

@@ -60,7 +60,7 @@ def load_feed():
         data = df.load_data(LOCAL_DATA)
     rows = [r for r in data.get("domains", {}).values()
             if r.get("status") != "TAKEN" and not df.RESTRICTED_RE.search(r.get("domain", ""))]
-    rows.sort(key=lambda r: (df.PRIORITY.get(r.get("status"), 9), -r.get("score", 0)))
+    rows.sort(key=lambda r: (-(r.get("quality") or 0), df.PRIORITY.get(r.get("status"), 9), -r.get("score", 0)))
     for r in rows:  # always use this deployment's affiliate code
         r["buy_url"] = df.buy_url(r["domain"])
         srcs = r.get("sources") or []
@@ -69,6 +69,8 @@ def load_feed():
                 s["via"] = df.infer_via(s.get("domain") or df.registrable(urlparse(s.get("url", "")).hostname or ""))
         if not r.get("via"):
             r["via"] = ",".join(sorted({s["via"] for s in srcs if s.get("via")}))
+        if r.get("quality") is None:
+            r["quality"], r["quality_reasons"] = df.quality_score(r)
         auth = r.get("opr") if r.get("opr") is not None else r.get("cc_authority")
         r["authority"] = auth if auth not in ("", None) else None
     feed = {"updated": data.get("updated", ""), "runs": data.get("runs", [])[:10], "rows": rows}
@@ -317,6 +319,8 @@ td a{color:var(--teal);overflow-wrap:anywhere}
 .PENDING_DELETE,.REDEMPTION,.EXPIRED_GRACE{background:#990f3d1f;color:var(--claret)}
 .flag{font-size:12px;color:var(--claret)}
 .count{margin:0 0 8px;font-size:14px;color:var(--mute)}.count b{color:var(--ink)}
+.q{display:inline-block;min-width:38px;text-align:center;font-weight:800;border-radius:6px;padding:2px 6px}
+.qhi{background:#0d768026;color:var(--teal)}.qmid{background:var(--line)}.qlo{color:var(--mute)}
 details summary{cursor:pointer;color:var(--mute);font-size:13px}
 details ul{margin:6px 0 0;padding-left:18px;font-size:13px}
 pre.log{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;max-height:220px;overflow:auto;font-size:13px;white-space:pre-wrap}
@@ -339,10 +343,10 @@ footer{color:var(--mute);font-size:13px;padding:24px 0 40px}
 {% if view == "feed" %}
 <div class="hero">
   <div><h1>Expired domains that still have <span>authority backlinks</span></h1>
-  <p class="lede">Found automatically. Every few hours dropfinder reads dofollow link sources that die often - Hacker News
-  front-page stories, Debian package homepages, EU research project sites and the oldest pages of top-ranked websites -
-  plus Wikipedia's dead-link lists, checks every domain they link to, and lists the ones that are free, dropping or expired,
-  ranked by the authority of the sites linking to them.</p></div>
+  <p class="lede">Found automatically, authority first. Every few hours dropfinder takes domains that already have strong
+  backlink profiles - the StableDomains quality drop feed, the Majestic Million and the top of Common Crawl's web graph -
+  finds the ones that are free or dropping, checks the Wayback Machine for a real site history, and scores each one 0-100.
+  Link discovery on Hacker News, Debian, EU research projects and ranked sites adds more.</p></div>
   <form class="huntbox" method="post" action="{{ url_for('hunt_auto') }}">
     <button type="submit">Hunt now</button>
     <p>Runs a fresh automatic hunt on {{ limits.auto }} random ranked sites (about 5-8 minutes). No input needed.</p>
@@ -351,6 +355,7 @@ footer{color:var(--mute);font-size:13px;padding:24px 0 40px}
 <div class="stats">
   <div class="stat"><b id="s-avail">-</b><span>available now</span></div>
   <div class="stat"><b id="s-drop">-</b><span>dropping / expired</span></div>
+  <div class="stat"><b id="s-q60">-</b><span>quality 60+</span></div>
   <div class="stat"><b id="s-total">-</b><span>tracked domains</span></div>
   <div class="stat"><b id="s-upd">-</b><span>last auto-hunt</span></div>
 </div>
@@ -358,16 +363,17 @@ footer{color:var(--mute);font-size:13px;padding:24px 0 40px}
   <div class="chips" id="chips"></div>
   <input type="text" id="q" placeholder="Search domain" aria-label="Search domain">
   <input type="text" id="tld" placeholder="TLDs e.g. com,org" aria-label="TLDs">
-  <select id="via" aria-label="Link source"><option value="">All sources</option><option value="hackernews">Hacker News</option>
+  <select id="via" aria-label="Link source"><option value="">All sources</option><option value="stabledomains">Drop feed</option>
+    <option value="majestic">Majestic Million</option><option value="commoncrawl">Top web graph</option><option value="hackernews">Hacker News</option>
     <option value="debian">Debian packages</option><option value="cordis">EU research projects</option>
     <option value="crawl">Ranked sites</option><option value="wikipedia">Wikipedia</option></select>
-  <label>Min score <input type="number" id="minscore" min="0" step="0.5" value="0"></label>
+  <label>Min quality <input type="number" id="minscore" min="0" max="100" step="5" value="0"></label>
   <label><input type="checkbox" id="dfonly"> Dofollow only</label>
   <label><input type="checkbox" id="nospam" checked> Hide spammy</label>
   <a class="btn small ghost" href="{{ url_for('feed_csv') }}">CSV</a>
 </div>
 <p class="count" id="count" aria-live="polite"></p>
-<div class="scroll"><table><thead><tr id="thead"></tr></thead><tbody id="rows"><tr><td class="empty" colspan="11"><span class="spin"></span>Loading finds...</td></tr></tbody></table></div>
+<div class="scroll"><table><thead><tr id="thead"></tr></thead><tbody id="rows"><tr><td class="empty" colspan="10"><span class="spin"></span>Loading finds...</td></tr></tbody></table></div>
 <p id="more" hidden><button class="btn ghost" id="morebtn" type="button">Show more</button></p>
 
 {% elif view == "custom" %}
@@ -428,10 +434,12 @@ Register links go to StableDomains (affiliate).</footer>
     EXPIRED_GRACE:"expired (grace)",EXPIRING_SOON:"expiring soon",PARKED:"parked",DEAD_SITE:"dead site",REGISTERED:"registered"};
   const ORDER = {AVAILABLE:0,PENDING_DELETE:1,REDEMPTION:2,EXPIRED_GRACE:3,LIKELY_AVAILABLE:4,EXPIRING_SOON:5,PARKED:6,DEAD_SITE:7};
   const BUY = new Set(["AVAILABLE","LIKELY_AVAILABLE"]);
-  const VIA = {hackernews:"Hacker News", debian:"Debian", cordis:"EU project", crawl:"ranked site", wikipedia:"Wikipedia"};
+  const VIA = {hackernews:"Hacker News", debian:"Debian", cordis:"EU project", crawl:"ranked site", wikipedia:"Wikipedia",
+    stabledomains:"Drop feed", majestic:"Majestic Million", commoncrawl:"Top web graph"};
+  const qClass = q => q >= 60 ? "qhi" : q >= 35 ? "qmid" : "qlo";
   const viaTags = v => (v || "").split(",").filter(Boolean).map(x => `<span class="via">${esc(VIA[x] || x)}</span>`).join("");
-  const COLS = [["domain","Domain"],["status","Status"],["score","Score"],["dofollow_sources","Dofollow sites"],
-    ["best_source_rank","Top linker rank"],["authority","Authority"],["cc_rank","Web rank"],["wb_years","Age (yrs)"],["expiry","Expiry"],["sources","Linked from"],["buy",""]];
+  const COLS = [["domain","Domain"],["status","Status"],["quality","Quality"],["ref_subnets","Ref. networks"],
+    ["authority","Authority"],["real_years","Real site (yrs)"],["dofollow_sources","Dofollow sites"],["expiry","Drops / expiry"],["sources","Source"],["buy",""]];
   function rowHtml(r) {
     const src = r.sources || [];
     const items = src.map(s => `<li>${link(s.url)} <span class="tag">${esc(s.follow)}</span>${s.rank ? ` <span class="tag">#${esc(Number(s.rank).toLocaleString())}</span>` : ""}${s.anchor ? ` "${esc(s.anchor)}"` : ""}</li>`).join("");
@@ -441,12 +449,16 @@ Register links go to StableDomains (affiliate).</footer>
     const buy = safeUrl(r.buy_url) ? esc(r.buy_url) : "#";
     const act = BUY.has(r.status) ? `<a class="btn small" href="${buy}" target="_blank" rel="noopener">Register${price}</a>`
       : `<a class="btn small ghost" href="${buy}" target="_blank" rel="noopener">Check</a>`;
-    return `<tr><td><b>${esc(r.domain)}</b>${flags}</td>
+    const why = (r.quality_reasons || []).map(x => `<li>${esc(x)}</li>`).join("");
+    const realY = r.real_years != null && r.real_years !== "" ? r.real_years : "";
+    return `<tr><td><b>${esc(r.domain)}</b>${flags}${why ? `<details><summary>why</summary><ul>${why}</ul></details>` : ""}</td>
       <td><span class="tag ${esc(r.status)}">${esc(NICE[r.status] || r.status)}</span></td>
-      <td class="n">${esc(r.score)}</td><td class="n">${esc(r.dofollow_sources)}</td>
-      <td class="n">${r.best_source_rank ? "#" + esc(Number(r.best_source_rank).toLocaleString()) : ""}</td>
-      <td class="n">${r.authority != null ? esc(r.authority) : ""}</td><td class="n">${r.cc_rank ? "#" + esc(Number(r.cc_rank).toLocaleString()) : ""}</td>
-      <td class="n">${r.wb_years ? esc(r.wb_years) : ""}</td><td>${esc((r.expiry || "").slice(0, 10))}</td>
+      <td class="n"><span class="q ${qClass(r.quality || 0)}">${r.quality != null ? esc(r.quality) : ""}</span></td>
+      <td class="n">${r.ref_subnets ? esc(Number(r.ref_subnets).toLocaleString()) : ""}</td>
+      <td class="n">${r.authority != null ? esc(r.authority) : ""}</td>
+      <td class="n">${esc(realY)}</td>
+      <td class="n">${r.dofollow_sources ? esc(r.dofollow_sources) : ""}</td>
+      <td>${esc((r.expiry || "").slice(0, 10))}</td>
       <td>${viaTags(r.via)}${link(first)}${src.length > 1 ? `<details><summary>${src.length} linking pages</summary><ul>${items}</ul></details>` : ""}</td>
       <td>${act}</td></tr>`;
   }
@@ -466,7 +478,7 @@ Register links go to StableDomains (affiliate).</footer>
     const ms = parseFloat($("minscore").value) || 0;
     let rows = all.filter(r => (!status.size || status.has(r.status)) && (!q || r.domain.includes(q))
       && (!tl.length || tl.includes(r.domain.split(".").slice(1).join(".")) || tl.includes(r.domain.split(".").pop()))
-      && (r.score || 0) >= ms && (!$("dfonly").checked || r.dofollow_sources > 0)
+      && (r.quality || 0) >= ms && (!$("dfonly").checked || r.dofollow_sources > 0)
       && (!$("nospam").checked || !(r.flags || "").includes("spammy"))
       && (!$("via").value || (r.via || "").split(",").includes($("via").value)));
     if (sortKey) rows = rows.slice().sort((a, b) => {
@@ -476,7 +488,7 @@ Register links go to StableDomains (affiliate).</footer>
       if (y === "" && x !== "") return -1;
       return (x > y ? 1 : x < y ? -1 : 0) * sortDir; });
     $("rows").innerHTML = rows.length ? rows.slice(0, shown).map(rowHtml).join("")
-      : `<tr><td class="empty" colspan="11">${all.length ? "Nothing matches these filters." : "No finds yet - the first automatic hunt runs within a few hours. Press Hunt now to run one."}</td></tr>`;
+      : `<tr><td class="empty" colspan="10">${all.length ? "Nothing matches these filters." : "No finds yet - the first automatic hunt runs within a few hours. Press Hunt now to run one."}</td></tr>`;
     $("more").hidden = rows.length <= shown;
     $("count").innerHTML = `Showing <b>${Math.min(rows.length, shown)}</b> of <b>${rows.length}</b> matching finds (${all.length} tracked)`;
   }
@@ -494,9 +506,10 @@ Register links go to StableDomains (affiliate).</footer>
     $("s-avail").textContent = all.filter(r => BUY.has(r.status)).length;
     $("s-drop").textContent = all.filter(r => ["PENDING_DELETE", "REDEMPTION", "EXPIRED_GRACE", "EXPIRING_SOON"].includes(r.status)).length;
     $("s-total").textContent = all.length;
+    $("s-q60").textContent = all.filter(r => (r.quality || 0) >= 60).length;
     $("s-upd").textContent = d.updated ? new Date(d.updated).toLocaleString([], {dateStyle: "short", timeStyle: "short"}) : "pending";
     render();
-  }).catch(() => { $("rows").innerHTML = `<tr><td class="empty" colspan="11">Couldn't load finds. Refresh to try again.</td></tr>`; });
+  }).catch(() => { $("rows").innerHTML = `<tr><td class="empty" colspan="10">Couldn't load finds. Refresh to try again.</td></tr>`; });
   {% elif view == "job" %}
   const id = {{ job.id|tojson }};
   head();

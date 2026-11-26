@@ -586,13 +586,13 @@ def cc_authority(pos, total):
     return round(max(0.0, 10 * (1 - math.log10(pos) / math.log10(max(total, 10)))), 1)
 
 
-def cc_web_ranks(domains, session=None, log=lambda m: None, max_seconds=1200, url=None):
+def cc_web_ranks(domains, session=None, log=lambda m: None, max_seconds=1200, url=None, window=None, window_out=None):
     """Stream Common Crawl's latest domain-level ranks file (several GB, gzip) once and return
     {domain: {"cc_rank": harmonic-centrality position, "cc_pr_rank": pagerank position, "cc_authority": 0-10}}.
     Dead domains keep a rank while other sites still link to them - that is the point."""
     import zlib
     want = {".".join(reversed(d.split("."))).encode(): d for d in domains}
-    if not want:
+    if not want and not window:
         return {}
     s = session or requests.Session()
     s.headers["User-Agent"] = UA
@@ -616,12 +616,18 @@ def cc_web_ranks(domains, session=None, log=lambda m: None, max_seconds=1200, ur
                 parts = ln.split(b"\t", 5)
                 if len(parts) < 5 or not parts[0][:1].isdigit():
                     continue
+                idx = total  # 0-based position in the file (the file is sorted by harmonic centrality)
                 total += 1
                 key = parts[4].strip()
                 if key in want:
                     found[want[key]] = (int(parts[0]), int(parts[2]))
+                if window and window_out is not None and window[0] <= idx < window[1]:
+                    window_out.append((".".join(reversed(key.decode("utf-8", "replace").split("."))),
+                                       int(parts[0]), int(parts[2])))
             if time.time() > t_end:
                 log("  time limit reached while streaming ranks; using what was read")
+                break
+            if not want and window and total >= window[1]:
                 break
         r.close()
     except (requests.RequestException, zlib.error) as e:
@@ -630,6 +636,194 @@ def cc_web_ranks(domains, session=None, log=lambda m: None, max_seconds=1200, ur
     out = {d: {"cc_rank": hc, "cc_pr_rank": pr, "cc_authority": cc_authority(hc, total)} for d, (hc, pr) in found.items()}
     log(f"  {total:,} domains scanned, {len(out)} of {len(want)} candidates ranked")
     return out
+
+
+# ---- authority-first sources (v3) ----------------------------------------------------------------
+# Start from domains that already have strong backlink profiles, then find the dead ones.
+SD_STATUS = {"available": "AVAILABLE", "pending_delete": "PENDING_DELETE", "redemption": "REDEMPTION",
+             "expired_grace": "EXPIRED_GRACE"}
+
+
+def stabledomains_feed(max_pages=40, session=None, log=lambda m: None, **filters):
+    """StableDomains quality drop feed (free, 25 rows a page, paged by cursor). Each row already has a
+    0-100 quality score built from Wayback real-site history, Majestic referring subnets and spam checks."""
+    s = session or requests.Session()
+    s.headers["User-Agent"] = UA
+    out, cursor = [], None
+    for _ in range(max_pages):
+        params = dict(filters, **({"cursor": cursor} if cursor else {}))
+        try:
+            j = s.get("https://stabledomains.net/api/v1/radar", params=params, timeout=30).json()
+            if not isinstance(j, dict):
+                raise ValueError("unexpected response")
+        except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+            log(f"  StableDomains feed stopped: {e}")
+            break
+        out.extend(j.get("items", []))
+        cursor = j.get("next_cursor")
+        if not cursor or not j.get("items"):
+            break
+        time.sleep(0.5)
+    return out
+
+
+def sd_item_to_row(it):
+    d = str(it.get("domain", "")).lower()
+    subnets = None
+    for reason in it.get("quality_reasons") or []:
+        m = re.search(r"([\d,]+) referring subnets", reason)
+        if m:
+            subnets = int(m.group(1).replace(",", ""))
+    first = (it.get("archived_since") or "")[:4]
+    return {"domain": d, "status": SD_STATUS.get(it.get("status"), "REGISTERED"), "score": 0.0,
+            "quality": it.get("quality"), "quality_reasons": it.get("quality_reasons") or [],
+            "dofollow_sources": 0, "nofollow_only_sources": 0, "edu_gov_sources": 0, "best_source_rank": "",
+            "expiry": it.get("drops_at") or "", "dns": "", "site": "", "ref_subnets": subnets,
+            "wb_first": first, "wb_years": (datetime.now(timezone.utc).year - int(first) + 1) if first else "",
+            "wb_months": it.get("wayback_months") or "", "sd_price": str(it.get("price_usd") or ""),
+            "sd_available": "yes" if it.get("status") == "available" else "",
+            "value_usd": it.get("value_usd"), "flags": ",".join(name_flags(d)) or ("spam" if it.get("spam") else ""),
+            "via": "stabledomains", "buy_url": buy_url(d),
+            "sources": [{"url": it.get("wayback_url") or f"https://web.archive.org/web/2*/{d}", "domain": "archive.org",
+                         "follow": "", "via": "stabledomains", "rank": None, "anchor": "Wayback history"}],
+            "best_source_url": "", "best_anchor": "", "link_target_url": "", "more_sources": ""}
+
+
+def majestic_million(session=None, log=lambda m: None):
+    """[(rank, domain, ref_subnets)] from the free Majestic Million list (top 1M sites by referring subnets).
+    It keeps listing domains for a while after they die - that is what we are fishing for."""
+    s = session or requests.Session()
+    s.headers["User-Agent"] = UA
+    try:
+        r = s.get("https://downloads.majestic.com/majestic_million.csv", timeout=300)
+        text = r.content.decode("utf-8", "replace")
+    except requests.RequestException as e:
+        log(f"  Majestic Million download failed: {e}")
+        return []
+    out = []
+    for row in csv.DictReader(io.StringIO(text)):
+        try:
+            out.append((int(row["GlobalRank"]), row["Domain"].strip().lower(), int(row.get("RefSubNets") or 0)))
+        except (KeyError, ValueError):
+            continue
+    log(f"  Majestic Million: {len(out):,} domains")
+    return out
+
+
+def dns_sweep(domains, workers=150, log=lambda m: None):
+    """Fast parallel NS lookup; returns the domains that do NOT resolve (nxdomain / no NS / errors)."""
+    resolvers = [make_resolver(ns) for ns in ("1.1.1.1", "8.8.8.8", "9.9.9.9")]
+    done, lock = [0], threading.Lock()
+
+    def one(i_d):
+        i, d = i_d
+        st = dns_status(d, resolvers[i % 3])
+        if st == "dns_error":  # retry once on another resolver before trusting it
+            st = dns_status(d, resolvers[(i + 1) % 3])
+        with lock:
+            done[0] += 1
+            if done[0] % 10000 == 0:
+                log(f"    DNS {done[0]:,}/{len(domains):,}")
+        return d, st
+
+    with ThreadPoolExecutor(workers) as ex:
+        res = list(ex.map(one, enumerate(domains)))
+    return {d: st for d, st in res if st != "has_ns"}
+
+
+WB_REAL_MIN_WORDS = 120
+
+
+def wayback_real_history(domain, session, samples=4):
+    """Sample archived homepages across the years and classify each as real content vs parked/for-sale/empty.
+    Returns {"real_ratio", "real_years", "wb_first", "wb_last", "wb_years", "parked_only"}."""
+    try:
+        r = session.get("https://web.archive.org/cdx/search/cdx", timeout=30, params={
+            "url": domain, "output": "json", "fl": "timestamp,original", "filter": "statuscode:200",
+            "collapse": "timestamp:4", "limit": "60"})
+        rows = [(str(x[0]), str(x[1]) if len(x) > 1 else f"http://{domain}/") for x in r.json()[1:]
+                if x and str(x[0])[:4].isdigit()]
+    except (requests.RequestException, ValueError, TypeError, IndexError):
+        return {}
+    if not rows:
+        return {"real_ratio": 0, "real_years": 0, "wb_years": 0, "parked_only": False, "never_archived": True}
+    years = sorted({int(t[:4]) for t, _ in rows})
+    step = max(1, len(rows) // samples)
+    picks = rows[::step][:samples]
+    real = 0
+    for ts, orig in picks:
+        try:
+            pr = session.get(f"https://web.archive.org/web/{ts}id_/{orig}", timeout=25, stream=True)
+            body = safe_decode(read_capped(pr, 400_000, 15), pr.encoding)
+            pr.close()
+        except requests.RequestException:
+            continue
+        text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", body)
+        text = re.sub(r"<[^>]+>", " ", text)
+        words = len(re.findall(r"[A-Za-zÀ-ɏ]{3,}", text))
+        if words >= WB_REAL_MIN_WORDS and not PARK_RE.search(text[:20000]):
+            real += 1
+        time.sleep(0.7)
+    ratio = real / max(1, len(picks))
+    span = years[-1] - years[0] + 1
+    return {"real_ratio": round(ratio, 2), "real_years": round(span * ratio, 1), "wb_first": str(years[0]),
+            "wb_last": str(years[-1]), "wb_years": span, "parked_only": real == 0, "never_archived": False}
+
+
+def quality_score(r):
+    """0-100: real site history, referring networks, web-graph authority, discovered dofollow links, minus spam."""
+    import math
+    reasons = []
+    q = 0.0
+    ry = r.get("real_years")
+    if ry not in (None, ""):
+        pts = min(float(ry), 15) / 15 * 35
+        q += pts
+        reasons.append(f"~{ry}y of real site history in the Wayback Machine")
+    elif r.get("wb_years"):
+        q += min(float(r["wb_years"]), 15) / 15 * 20
+        reasons.append(f"archived {r['wb_years']}y (content not verified)")
+    subnets = r.get("ref_subnets")
+    if subnets:
+        q += min(1.0, math.log10(subnets + 1) / 3) * 25
+        reasons.append(f"{subnets} referring subnets (Majestic)")
+    auth = r.get("opr") if r.get("opr") not in (None, "") else r.get("cc_authority")
+    if auth not in (None, ""):
+        q += float(auth) * 2
+        reasons.append(f"web-graph authority {auth}/10 (Common Crawl)")
+    if r.get("score"):
+        q += min(float(r["score"]), 10)
+        if r.get("dofollow_sources"):
+            reasons.append(f"{r['dofollow_sources']} dofollow linking site(s) found")
+    flags = r.get("flags") or ""
+    if "spam" in flags:
+        q -= 30
+        reasons.append("spammy name")
+    if r.get("parked_only"):
+        q -= 30
+        reasons.append("archive shows only parked / for-sale pages")
+    if r.get("never_archived"):
+        q -= 15
+        reasons.append("never archived")
+    if "digits+hyphens" in flags:
+        q -= 10
+    return max(0, min(100, round(q))), reasons
+
+
+def graph_rows(candidates, via, info, stamp):
+    """Rows for domains found by an authority-first scan (no crawled linking page)."""
+    rows = []
+    for d, rec in candidates.items():
+        meta = info.get(d, {})
+        rows.append({"domain": d, "status": rec["status"], "score": 0.0, "dofollow_sources": 0,
+                     "nofollow_only_sources": 0, "edu_gov_sources": 0, "best_source_rank": "",
+                     "expiry": rec.get("expiry", ""), "dns": rec.get("dns", ""), "site": "",
+                     "flags": ",".join(name_flags(d)), "via": via, "buy_url": buy_url(d), **meta,
+                     "sources": [{"url": f"https://web.archive.org/web/2*/{d}", "domain": "archive.org", "follow": "",
+                                  "via": via, "rank": None, "anchor": "Wayback history"}],
+                     "best_source_url": "", "best_anchor": "", "link_target_url": "", "more_sources": "",
+                     "first_seen": stamp, "last_checked": stamp})
+    return rows
 
 
 # ---- verified dofollow niches -------------------------------------------------------------
@@ -985,8 +1179,8 @@ BUYABLE = {"AVAILABLE", "LIKELY_AVAILABLE"}
 
 
 # --------------------------------------------------------------------------- library api
-CSV_COLS = ["domain", "status", "score", "dofollow_sources", "nofollow_only_sources", "edu_gov_sources",
-            "best_source_rank", "cc_authority", "cc_rank", "opr", "ref_domains", "via", "expiry", "dns", "site", "wb_first", "wb_last", "wb_years", "wb_months",
+CSV_COLS = ["domain", "status", "quality", "score", "dofollow_sources", "nofollow_only_sources", "edu_gov_sources",
+            "best_source_rank", "ref_subnets", "real_years", "cc_authority", "cc_rank", "opr", "ref_domains", "via", "expiry", "dns", "site", "wb_first", "wb_last", "wb_years", "wb_months",
             "sd_available", "sd_price", "flags", "best_source_url", "best_anchor", "link_target_url", "buy_url",
             "more_sources", "first_seen", "last_checked"]
 
@@ -1228,51 +1422,101 @@ def load_data(path):
         return {"domains": {}, "runs": []}
 
 
-def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_minutes=40, sites=250,
-         wiki_months=4, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=5000,
-         seed=None, hn_months=3, debian_sample=2500, cordis_sample=2500, cc_ranks=True, log=print):
-    """Fully automatic run: ranked sites' old pages + Wikipedia dead-link months + your seeds.txt,
-    then check, verify and merge into the data file."""
+def _merge(old, r, stamp):
+    prev = old.get(r["domain"])
+    r["first_seen"] = prev.get("first_seen", stamp) if prev else r.get("first_seen", stamp)
+    r["last_checked"] = stamp
+    if prev:  # keep the best evidence we have seen
+        if prev.get("score", 0) > r.get("score", 0):
+            r["score"], r["sources"] = prev["score"], prev.get("sources", r.get("sources"))
+            r["dofollow_sources"] = max(r.get("dofollow_sources", 0), prev.get("dofollow_sources", 0))
+        vias = {v for v in (prev.get("via", "") + "," + r.get("via", "")).split(",") if v}
+        r["via"] = ",".join(sorted(vias))
+        for k in ("wb_first", "wb_last", "wb_years", "wb_months", "opr", "ref_domains", "cc_rank", "cc_pr_rank",
+                  "cc_authority", "ref_subnets", "real_years", "real_ratio", "parked_only", "never_archived",
+                  "mm_rank", "value_usd"):
+            if r.get(k) in (None, "") and prev.get(k) not in (None, ""):
+                r[k] = prev[k]
+    old[r["domain"]] = r
+
+
+def graph_scan(pairs, info, log, label):
+    """pairs: domains in authority order. DNS sweep -> registry check -> candidate rows."""
+    pairs = [d for d in pairs if d and not RESTRICTED_RE.search(d) and d not in IGNORE_TARGETS]
+    log(f"{label}: DNS sweep of {len(pairs):,} high-authority domains...")
+    dead = dns_sweep(pairs, log=log)
+    log(f"  {len(dead):,} do not resolve; asking the registries...")
+    recs = status_check(list(dead), rdap_all=True, workers=40, log=log) if dead else {}
+    cands = {d: r for d, r in recs.items() if r["status"] != "REGISTERED"}
+    log(f"  {len(cands)} are available / dropping / expired")
+    return cands
+
+
+def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_minutes=40, sites=100,
+         wiki_months=2, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=6000,
+         seed=None, hn_months=4, debian_sample=1500, cordis_sample=1500, cc_ranks=True,
+         sd_pages=40, majestic_batch=40000, cc_batch=40000, wayback_checks=150, log=print):
+    """Fully automatic run.
+    Authority-first: StableDomains quality drop feed, a rotating batch of the Majestic Million and of the
+    Common Crawl ranking (DNS + registry checks), then link discovery (ranked sites, Hacker News, Debian,
+    EU projects, Wikipedia). Every candidate gets a Wayback real-history check and a 0-100 Quality score."""
     t0 = time.time()
     rng = random.Random(seed)
+    data = load_data(data_path)
+    cursors = data.get("cursors", {"majestic": 0, "cc": 0})
+    old = {d: r for d, r in data.get("domains", {}).items() if not RESTRICTED_RE.search(d)}
+    stamp = now_iso()
+    by_source = defaultdict(int)
+
+    # 1. StableDomains quality feed
+    if sd_pages:
+        log("Reading the StableDomains quality drop feed...")
+        items = stabledomains_feed(sd_pages, sort="quality", log=log)
+        sd_rows = [sd_item_to_row(it) for it in items if it.get("status") in SD_STATUS and not it.get("spam")]
+        sd_rows = [r for r in sd_rows if r["domain"] and not RESTRICTED_RE.search(r["domain"])]
+        log(f"  {len(sd_rows)} quality-scored drops")
+        for r in sd_rows:
+            _merge(old, r, stamp)
+        by_source["stabledomains"] = len(sd_rows)
+
+    # 2. Majestic Million batch
+    if majestic_batch:
+        mm = majestic_million(log=log)
+        if mm:
+            start = cursors.get("majestic", 0) % len(mm)
+            batch = mm[start:start + majestic_batch]
+            cursors["majestic"] = (start + majestic_batch) % len(mm)
+            info = {d: {"ref_subnets": sub, "mm_rank": rk} for rk, d, sub in batch}
+            cands = graph_scan([d for _, d, _ in batch], info, log, f"Majestic Million ranks {start + 1:,}+")
+            for r in graph_rows(cands, "majestic", info, stamp):
+                _merge(old, r, stamp)
+            by_source["majestic"] = len(cands)
+
+    # 3. link discovery
     AUTH.load(log)
-    ranked = sample_ranked_sites(sites, rng=rng) if AUTH.rank else []
+    ranked = sample_ranked_sites(sites, rng=rng) if AUTH.rank and sites else []
     my_seeds = []
     if seeds_file and os.path.exists(seeds_file):
         my_seeds = [l.strip() for l in open(seeds_file) if l.strip() and not l.lstrip().startswith("#")]
-    cats = random_dead_link_categories(wiki_months, rng)
-    deadline = t0 + budget_minutes * 60 * 0.55
+    cats = random_dead_link_categories(wiki_months, rng) if wiki_months else []
+    deadline = time.time() + budget_minutes * 60 * 0.3
     records = harvest(my_seeds, sitemaps=True, ranked_sites=ranked, wiki_categories=cats, wiki_limit=wiki_limit,
                       workers=workers, deadline=deadline, hn_months=hn_months, debian_sample=debian_sample,
                       cordis_sample=cordis_sample, rng=rng, log=log)
+    for v in ("crawl", "wikipedia", "hackernews", "debian", "cordis"):
+        by_source[v + "_links"] = sum(1 for r in records if r.get("via") == v)
     log(f"Harvested {len(records)} links ({sum(r['follow'] == 'dofollow' for r in records)} dofollow) "
-        f"to {len({r['target_domain'] for r in records})} domains in {int(time.time() - t0)}s.")
-
-    data = load_data(data_path)
-    old = {d: r for d, r in data.get("domains", {}).items() if not RESTRICTED_RE.search(d)}
+        f"to {len({r['target_domain'] for r in records})} domains.")
     rows = check(records, workers=40, wayback=True, wayback_top=300, verify=True, opr_key=opr_key,
-                 site_check_top=1500, max_domains=20000, log=log)
-    stamp = now_iso()
+                 site_check_top=1000, max_domains=15000, log=log)
     for r in rows:
-        prev = old.get(r["domain"])
-        r["first_seen"] = prev.get("first_seen", stamp) if prev else stamp
-        r["last_checked"] = stamp
-        if prev:  # keep the best evidence we have seen
-            if prev.get("score", 0) > r["score"]:
-                r["score"], r["sources"] = prev["score"], prev.get("sources", r["sources"])
-                r["dofollow_sources"] = max(r["dofollow_sources"], prev.get("dofollow_sources", 0))
-            for k in ("wb_first", "wb_last", "wb_years", "wb_months", "opr", "ref_domains", "cc_rank", "cc_pr_rank",
-                      "cc_authority"):
-                if k not in r and k in prev:
-                    r[k] = prev[k]
-        old[r["domain"]] = r
+        _merge(old, r, stamp)
 
-    # re-check domains found in earlier runs that were not re-found this time
-    fresh = {r["domain"] for r in rows}
-    stale = [d for d, r in old.items() if d not in fresh and r.get("status") != "TAKEN"]
+    # 4. re-check earlier finds that were not refreshed this run
+    fresh_stamp = {d for d, r in old.items() if r.get("last_checked") == stamp}
+    stale = [d for d, r in old.items() if d not in fresh_stamp and r.get("status") != "TAKEN"]
     if stale:
         log(f"Re-checking {len(stale)} domains from earlier runs...")
-        # always ask the registry: a live-looking domain may still be expiring, in grace or in redemption
         recs = status_check(stale, rdap_all=True,
                             site_check=[d for d in stale if old[d].get("status") in ("PARKED", "DEAD_SITE")], log=log)
         for d, rec in recs.items():
@@ -1280,38 +1524,82 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
             if rec["status"] == "REGISTERED" and rec.get("registration") == "registered":
                 r["status"], r["taken_at"] = "TAKEN", stamp
             elif rec["status"] == "REGISTERED":
-                r["last_checked"] = stamp  # registry unreachable / unknown: keep the old status
+                r["last_checked"] = stamp
             else:
                 r.update(status=rec["status"], expiry=rec.get("expiry", r.get("expiry", "")), dns=rec.get("dns", ""),
                          site=rec.get("site", r.get("site", "")), last_checked=stamp)
+
+    # 5. Common Crawl: authority for every candidate + a rotating window of top-ranked domains to scan
     if cc_ranks:
-        need = [d for d, r in old.items() if r.get("status") != "TAKEN" and "cc_rank" not in r]
-        log(f"Looking up Common Crawl web-graph authority for {len(need)} domains...")
-        for d, info in cc_web_ranks(need, log=log).items():
-            old[d].update(info)
-        for d in need:  # not in the graph at all = no links seen by Common Crawl
+        need = [d for d, r in old.items() if r.get("status") != "TAKEN" and r.get("cc_rank") in (None,)]
+        start = cursors.get("cc", 0)
+        window = (start, start + cc_batch) if cc_batch else None
+        win = []
+        log(f"Common Crawl web graph: authority for {len(need)} domains"
+            + (f", scanning ranks {start + 1:,}-{start + cc_batch:,}" if window else "") + "...")
+        found = cc_web_ranks(need, log=log, window=window, window_out=win)
+        for d, inf in found.items():
+            old[d].update(inf)
+        for d in need:
             old[d].setdefault("cc_rank", "")
+        if window:
+            cursors["cc"] = start + cc_batch if win else 0
+            info = {}
+            total_est = 1.2e8
+            for d, hc, pr in win:
+                info[d] = {"cc_rank": hc, "cc_pr_rank": pr, "cc_authority": cc_authority(hc, total_est)}
+            cands = graph_scan([d for d, _, _ in win], info, log, "Common Crawl top ranks")
+            for r in graph_rows(cands, "commoncrawl", info, stamp):
+                _merge(old, r, stamp)
+            by_source["commoncrawl"] = len(cands)
+
+    # 6. Wayback real-history check for unverified candidates (best first), then Quality for everything
+    live = [r for r in old.values() if r.get("status") not in ("TAKEN", "REGISTERED")]
+    todo = [r for r in live if r.get("via") != "stabledomains" and r.get("real_years") in (None,)
+            and r.get("status") in ("AVAILABLE", "LIKELY_AVAILABLE", "PENDING_DELETE", "REDEMPTION", "EXPIRED_GRACE")]
+    todo.sort(key=lambda r: -((r.get("ref_subnets") or 0) + (r.get("cc_authority") or 0) * 50 + r.get("score", 0) * 20))
+    todo = todo[:wayback_checks]
+    if todo:
+        log(f"Checking Wayback real-site history for {len(todo)} candidates...")
+        sess = requests.Session()
+        sess.headers["User-Agent"] = UA
+        with ThreadPoolExecutor(3) as ex:
+            def wb_safe(r):
+                try:
+                    return wayback_real_history(r["domain"], sess)
+                except Exception:  # noqa: BLE001
+                    return {}
+            for r, h in zip(todo, ex.map(wb_safe, todo)):
+                if h:
+                    r.update({k: v for k, v in h.items() if v not in (None, "") or k in ("real_years",)})
+    for r in old.values():
+        if r.get("via") == "stabledomains" and r.get("quality") is not None and "real_years" not in r:
+            continue  # StableDomains already scored it
+        q, why = quality_score(r)
+        r["quality"], r["quality_reasons"] = q, why
+
     cutoff = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
     old = {d: r for d, r in old.items() if not (r.get("status") == "TAKEN" and r.get("taken_at", "") < cutoff)}
-    keep = sorted(old.values(), key=lambda r: (r.get("status") == "TAKEN", PRIORITY.get(r.get("status"), 9),
-                                               -r.get("score", 0)))[:max_keep]
+    keep = sorted(old.values(), key=lambda r: (r.get("status") in ("TAKEN", "REGISTERED"), -(r.get("quality") or 0),
+                                               PRIORITY.get(r.get("status"), 9)))[:max_keep]
     counts = defaultdict(int)
     for r in keep:
         counts[r["status"]] += 1
     run = {"at": stamp, "seconds": int(time.time() - t0), "ranked_sites": len(ranked), "wiki_categories": cats,
-           "by_source": {v: sum(1 for r in records if r.get("via") == v) for v in
-                         ("crawl", "wikipedia", "hackernews", "debian", "cordis")},
-           "links": len(records), "new_candidates": len([r for r in rows if r["first_seen"] == stamp]),
+           "by_source": dict(by_source), "links": len(records),
+           "new_candidates": len([r for r in keep if r.get("first_seen") == stamp]),
+           "quality_60_plus": len([r for r in keep if (r.get("quality") or 0) >= 60 and r["status"] != "TAKEN"]),
            "counts": dict(counts)}
-    data = {"updated": stamp, "tranco_loaded": bool(AUTH.rank), "runs": ([run] + data.get("runs", []))[:30],
-            "domains": {r["domain"]: r for r in keep}}
+    data = {"updated": stamp, "tranco_loaded": bool(AUTH.rank), "cursors": cursors,
+            "runs": ([run] + data.get("runs", []))[:30], "domains": {r["domain"]: r for r in keep}}
     os.makedirs(os.path.dirname(data_path) or ".", exist_ok=True)
     with open(data_path, "w") as f:
         json.dump(data, f, separators=(",", ":"))
     if csv_path:
         with open(csv_path, "w", newline="") as f:
             write_csv([r for r in keep if r["status"] != "TAKEN"], f)
-    log(f"Done in {int(time.time() - t0)}s: {run['new_candidates']} new, {len(keep)} tracked. {dict(counts)}")
+    log(f"Done in {int(time.time() - t0)}s: {run['new_candidates']} new, {len(keep)} tracked, "
+        f"{run['quality_60_plus']} with quality 60+. {dict(counts)}")
     return data
 
 
@@ -1353,7 +1641,8 @@ def cmd_check(a):
 def cmd_hunt(a):
     hunt(a.data, a.csv, a.budget_minutes, a.sites, a.wiki_months, a.wiki_limit, a.seeds,
          os.environ.get("OPR_API_KEY"), a.workers, seed=a.random_seed, hn_months=a.hn_months,
-         debian_sample=a.debian, cordis_sample=a.cordis, cc_ranks=not a.no_cc_ranks,
+         debian_sample=a.debian, cordis_sample=a.cordis, cc_ranks=not a.no_cc_ranks, sd_pages=a.sd_pages,
+         majestic_batch=a.majestic, cc_batch=a.cc_batch, wayback_checks=a.wayback_checks,
          log=lambda m: print(m, flush=True))
 
 
@@ -1452,14 +1741,18 @@ def main():
     k.add_argument("--data", default="data/candidates.json")
     k.add_argument("--csv", default="data/latest.csv")
     k.add_argument("--budget-minutes", type=int, default=40)
-    k.add_argument("--sites", type=int, default=250, help="random Tranco-ranked sites to sample")
-    k.add_argument("--wiki-months", type=int, default=4, help="random Wikipedia dead-link months")
+    k.add_argument("--sites", type=int, default=100, help="random Tranco-ranked sites to sample")
+    k.add_argument("--wiki-months", type=int, default=2, help="random Wikipedia dead-link months")
     k.add_argument("--wiki-limit", type=int, default=150, help="articles per Wikipedia month")
     k.add_argument("--seeds", default="seeds.txt", help="your own seed pages (optional)")
-    k.add_argument("--hn-months", type=int, default=3, help="random Hacker News months (100+ point stories)")
-    k.add_argument("--debian", type=int, default=2500, help="random Debian package homepages")
-    k.add_argument("--cordis", type=int, default=2500, help="random EU research project websites")
+    k.add_argument("--hn-months", type=int, default=4, help="random Hacker News months (100+ point stories)")
+    k.add_argument("--debian", type=int, default=1500, help="random Debian package homepages")
+    k.add_argument("--cordis", type=int, default=1500, help="random EU research project websites")
     k.add_argument("--no-cc-ranks", action="store_true", help="skip the Common Crawl authority lookup")
+    k.add_argument("--sd-pages", type=int, default=40, help="pages (25 rows) of the StableDomains quality feed")
+    k.add_argument("--majestic", type=int, default=40000, help="Majestic Million domains to DNS-scan per run")
+    k.add_argument("--cc-batch", type=int, default=40000, help="top Common Crawl domains to DNS-scan per run")
+    k.add_argument("--wayback-checks", type=int, default=150, help="candidates to verify in the Wayback Machine")
     k.add_argument("--workers", type=int, default=24)
     k.add_argument("--random-seed", type=int)
     k.set_defaults(fn=cmd_hunt)
