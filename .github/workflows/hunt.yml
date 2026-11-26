@@ -10,7 +10,7 @@ on:
         default: "200"
       budget:
         description: "Time budget (minutes)"
-        default: "55"
+        default: "80"
 
 permissions:
   contents: write
@@ -38,13 +38,14 @@ jobs:
         run: |
           python dropfinder.py hunt \
             --sites "${{ github.event.inputs.sites || '200' }}" \
-            --budget-minutes "${{ github.event.inputs.budget || '55' }}" \
+            --budget-minutes "${{ github.event.inputs.budget || '80' }}" \
             --data data/candidates.json --csv data/latest.csv
       - name: Commit results
+        if: always()
         run: |
           git config user.name "dropfinder-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/
+          git add data/ || true
           git diff --cached --quiet && exit 0
           git commit -m "auto-hunt $(date -u +'%Y-%m-%d %H:%M')"
           for i in 1 2 3; do git pull --rebase -X theirs && git push && break; sleep 5; done

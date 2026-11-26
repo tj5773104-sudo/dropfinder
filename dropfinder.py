@@ -1641,13 +1641,21 @@ def graph_scan(pairs, info, log, label):
 def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_minutes=40, sites=100,
          wiki_months=2, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=6000,
          seed=None, hn_months=4, debian_sample=1500, cordis_sample=1500, cc_ranks=True,
-         sd_pages=40, majestic_batch=40000, cc_batch=40000, wayback_checks=150, wikidata_types=8,
+         sd_pages=40, majestic_batch=25000, cc_batch=25000, wayback_checks=150, wikidata_types=8,
          publisher_sites=8, log=print):
     """Fully automatic run.
     Authority-first: StableDomains quality drop feed, a rotating batch of the Majestic Million and of the
     Common Crawl ranking (DNS + registry checks), then link discovery (ranked sites, Hacker News, Debian,
     EU projects, Wikipedia). Every candidate gets a Wayback real-history check and a 0-100 Quality score."""
     t0 = time.time()
+    hard_stop = t0 + budget_minutes * 60 * 0.85  # leave time to score, save and commit
+
+    def time_left(stage):
+        if time.time() > hard_stop:
+            log(f"Time budget nearly used - skipping {stage}.")
+            return False
+        return True
+
     rng = random.Random(seed)
     data = load_data(data_path)
     cursors = data.get("cursors", {"majestic": 0, "cc": 0})
@@ -1666,8 +1674,20 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
             _merge(old, r, stamp)
         by_source["stabledomains"] = len(sd_rows)
 
+    def checkpoint(label):
+        """Save progress so a run stopped by the time limit still keeps what it found."""
+        try:
+            os.makedirs(os.path.dirname(data_path) or ".", exist_ok=True)
+            snap = dict(data, cursors=cursors, domains={**data.get("domains", {}), **old}, updated=stamp)
+            with open(data_path, "w") as f:
+                json.dump(snap, f, separators=(",", ":"))
+            log(f"  (checkpoint saved after {label}: {len(old)} domains)")
+        except (OSError, TypeError, ValueError) as e:
+            log(f"  checkpoint failed: {e}")
+
+    checkpoint("drop feed")
     # 2. Majestic Million batch
-    if majestic_batch:
+    if majestic_batch and time_left("Majestic Million"):
         mm = majestic_million(log=log)
         if mm:
             start = cursors.get("majestic", 0) % len(mm)
@@ -1678,6 +1698,7 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
             for r in graph_rows(cands, "majestic", info, stamp):
                 _merge(old, r, stamp)
             by_source["majestic"] = len(cands)
+            checkpoint("Majestic Million")
 
     # 3. link discovery
     AUTH.load(log)
@@ -1686,8 +1707,8 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     if seeds_file and os.path.exists(seeds_file):
         my_seeds = [l.strip() for l in open(seeds_file) if l.strip() and not l.lstrip().startswith("#")]
     cats = random_dead_link_categories(wiki_months, rng) if wiki_months else []
-    deadline = time.time() + budget_minutes * 60 * 0.3
-    records = harvest(my_seeds, sitemaps=True, ranked_sites=ranked, wiki_categories=cats, wiki_limit=wiki_limit,
+    deadline = min(time.time() + budget_minutes * 60 * 0.3, hard_stop)
+    records = [] if not time_left("link discovery") else harvest(my_seeds, sitemaps=True, ranked_sites=ranked, wiki_categories=cats, wiki_limit=wiki_limit,
                       workers=workers, deadline=deadline, hn_months=hn_months, debian_sample=debian_sample,
                       cordis_sample=cordis_sample, rng=rng, wikidata_types=wikidata_types,
                       publisher_sites=publisher_sites, log=log)
@@ -1696,14 +1717,15 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     log(f"Harvested {len(records)} links ({sum(r['follow'] == 'dofollow' for r in records)} dofollow) "
         f"to {len({r['target_domain'] for r in records})} domains.")
     rows = check(records, workers=40, wayback=True, wayback_top=300, verify=True, opr_key=opr_key,
-                 site_check_top=1000, max_domains=15000, log=log)
+                 site_check_top=1000, max_domains=15000, log=log) if records else []
     for r in rows:
         _merge(old, r, stamp)
+    checkpoint("link discovery")
 
     # 4. re-check earlier finds that were not refreshed this run
     fresh_stamp = {d for d, r in old.items() if r.get("last_checked") == stamp}
     stale = [d for d, r in old.items() if d not in fresh_stamp and r.get("status") != "TAKEN"]
-    if stale:
+    if stale and time_left("re-checks"):
         log(f"Re-checking {len(stale)} domains from earlier runs...")
         recs = status_check(stale, rdap_all=True,
                             site_check=[d for d in stale if old[d].get("status") in ("PARKED", "DEAD_SITE")], log=log)
@@ -1718,14 +1740,15 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
                          site=rec.get("site", r.get("site", "")), last_checked=stamp)
 
     # 5. Common Crawl: authority for every candidate + a rotating window of top-ranked domains to scan
-    if cc_ranks:
+    if cc_ranks and time_left("Common Crawl"):
         need = [d for d, r in old.items() if r.get("status") != "TAKEN" and r.get("cc_rank") in (None,)]
         start = cursors.get("cc", 0)
         window = (start, start + cc_batch) if cc_batch else None
         win = []
         log(f"Common Crawl web graph: authority for {len(need)} domains"
             + (f", scanning ranks {start + 1:,}-{start + cc_batch:,}" if window else "") + "...")
-        found = cc_web_ranks(need, log=log, window=window, window_out=win)
+        found = cc_web_ranks(need, log=log, window=window, window_out=win,
+                             max_seconds=max(120, min(1200, hard_stop - time.time() - 300)))
         for d, inf in found.items():
             old[d].update(inf)
         for d in need:
@@ -1736,7 +1759,7 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
             total_est = 1.2e8
             for d, hc, pr in win:
                 info[d] = {"cc_rank": hc, "cc_pr_rank": pr, "cc_authority": cc_authority(hc, total_est)}
-            cands = graph_scan([d for d, _, _ in win], info, log, "Common Crawl top ranks")
+            cands = graph_scan([d for d, _, _ in win], info, log, "Common Crawl top ranks") if time_left("Common Crawl scan") else {}
             for r in graph_rows(cands, "commoncrawl", info, stamp):
                 _merge(old, r, stamp)
             by_source["commoncrawl"] = len(cands)
@@ -1746,7 +1769,7 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     todo = [r for r in live if r.get("via") != "stabledomains" and r.get("real_years") in (None,)
             and r.get("status") in ("AVAILABLE", "LIKELY_AVAILABLE", "PENDING_DELETE", "REDEMPTION", "EXPIRED_GRACE")]
     todo.sort(key=lambda r: -((r.get("ref_subnets") or 0) + (r.get("cc_authority") or 0) * 50 + r.get("score", 0) * 20))
-    todo = todo[:wayback_checks]
+    todo = todo[:wayback_checks] if time.time() < t0 + budget_minutes * 60 * 0.95 else todo[:30]
     if todo:
         log(f"Checking Wayback real-site history for {len(todo)} candidates...")
         sess = requests.Session()
@@ -1947,8 +1970,8 @@ def main():
     k.add_argument("--cordis", type=int, default=1500, help="random EU research project websites")
     k.add_argument("--no-cc-ranks", action="store_true", help="skip the Common Crawl authority lookup")
     k.add_argument("--sd-pages", type=int, default=40, help="pages (25 rows) of the StableDomains quality feed")
-    k.add_argument("--majestic", type=int, default=40000, help="Majestic Million domains to DNS-scan per run")
-    k.add_argument("--cc-batch", type=int, default=40000, help="top Common Crawl domains to DNS-scan per run")
+    k.add_argument("--majestic", type=int, default=25000, help="Majestic Million domains to DNS-scan per run")
+    k.add_argument("--cc-batch", type=int, default=25000, help="top Common Crawl domains to DNS-scan per run")
     k.add_argument("--wayback-checks", type=int, default=150, help="candidates to verify in the Wayback Machine")
     k.add_argument("--wikidata-types", type=int, default=8, help="random kinds of defunct organisations to read")
     k.add_argument("--publishers", type=int, default=8, help="top publisher / gov sites whose old pages to read")
