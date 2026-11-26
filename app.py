@@ -252,7 +252,8 @@ def job_json(jid):
     j = get_job(jid)
     return jsonify(state=j["state"], log=j["log"][-40:], links=j["links"], dofollow_links=j["dofollow_links"],
                    unique_domains=j["unique_domains"],
-                   rows=[{k: v for k, v in r.items() if k != "more_sources"} for r in j["rows"]]
+                   rows=[dict({k: v for k, v in r.items() if k != "more_sources"},
+                              quality=r.get("quality", df.quality_score(r)[0])) for r in j["rows"]]
                    if j["state"] == "done" else [])
 
 
@@ -278,135 +279,136 @@ PAGE = r"""<!doctype html>
 <title>dropfinder - expired domains with authority backlinks</title>
 <link href="https://fonts.googleapis.com/css2?family=Libre+Franklin:wght@400;600;800&display=swap" rel="stylesheet">
 <style>
+/* VOICE: a trader's watchlist - dense, calm, scannable on a phone.
+   IDEA: each domain is a ticket card; the quality badge is the price tag.
+   PICTURE: the card grid itself is the picture.
+   COLOUR/TYPE: warm paper ground, teal for good, claret for urgent; Libre Franklin.
+   LAYOUT: slim header, one control row, cards 1/2/3 columns. */
 :root{color-scheme:light dark;--bg:light-dark(#fff8f5,#1c1512);--card:light-dark(#fff,#261d19);--ink:light-dark(#1a1817,#f3ebe6);
---mute:light-dark(#6b625d,#b3a69e);--line:light-dark(#ecd9d1,#3a2d27);--teal:light-dark(#0d7680,#4fb3bc);--claret:light-dark(#990f3d,#ff8fb1)}
+--mute:light-dark(#6b625d,#b3a69e);--line:light-dark(#ecd9d1,#3a2d27);--teal:light-dark(#0d7680,#4fb3bc);--claret:light-dark(#990f3d,#ff8fb1);
+--tealbg:light-dark(#0d76801f,#4fb3bc26);--claretbg:light-dark(#990f3d17,#ff8fb126)}
+:root[data-theme=light]{color-scheme:light}:root[data-theme=dark]{color-scheme:dark}
 *{box-sizing:border-box;min-width:0}
-body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 "Libre Franklin",system-ui,sans-serif}
-.wrap{max-width:1280px;margin:auto;padding:0 max(4vw,16px)}
-nav{display:flex;gap:18px;align-items:center;flex-wrap:wrap;padding:16px 0;border-bottom:1px solid var(--line)}
-nav b{font-weight:800;font-size:20px;margin-right:auto}nav a{color:var(--ink);text-decoration:none;font-weight:600}
-nav a.on{color:var(--teal)}
-h1{font-weight:800;font-size:clamp(28px,4.5vw,44px);line-height:1.05;margin:24px 0 8px;text-wrap:balance}
-h1 span{color:var(--teal)}
-.lede{color:var(--mute);max-width:70ch;margin:0 0 18px}
-.stats{display:flex;flex-wrap:wrap;gap:12px;margin:8px 0 18px}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;min-width:140px}
-.stat b{display:block;font-size:28px;font-weight:800;line-height:1.1}.stat span{font-size:13px;color:var(--mute)}
-.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:12px}
-.bar input[type=text],.bar input[type=number]{font:16px inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);min-height:42px}
-.bar select{font:16px inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);min-height:42px}
-.bar input[type=number]{width:80px}
-.via{display:inline-block;font-size:11px;font-weight:600;padding:1px 7px;border-radius:99px;border:1px solid var(--teal);color:var(--teal);margin:0 4px 4px 0;white-space:nowrap}.bar label{display:flex;gap:6px;align-items:center;font-size:14px}
-.chips{display:flex;flex-wrap:wrap;gap:6px}
-.chip{border:1px solid var(--line);background:var(--bg);color:var(--ink);border-radius:99px;padding:6px 12px;font:600 13px inherit;cursor:pointer;min-height:36px}
-.chip[aria-pressed=true]{background:var(--teal);border-color:var(--teal);color:#fff}
-button,.btn{display:inline-flex;align-items:center;gap:6px;background:var(--teal);color:#fff;border:0;border-radius:8px;padding:11px 20px;font:600 16px inherit;cursor:pointer;text-decoration:none;min-height:44px;white-space:nowrap}
-.btn.small{padding:6px 12px;font-size:13px;min-height:32px;border-radius:6px}
-.btn.ghost{background:transparent;color:var(--teal);border:1px solid var(--teal)}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Libre Franklin",system-ui,sans-serif;overflow-x:clip}
+a{color:var(--teal)}
+.wrap{max-width:1280px;margin:auto;padding:0 max(3vw,12px)}
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;border-bottom:1px solid var(--line)}
+header .logo{font-weight:800;font-size:19px;color:var(--ink);text-decoration:none;margin-right:auto}
+header nav{display:flex;gap:14px}header nav a{color:var(--mute);text-decoration:none;font-weight:600;font-size:14px}
+header nav a.on{color:var(--ink)}
+button,.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;background:var(--teal);color:#fff;border:0;border-radius:8px;
+  padding:9px 16px;font:600 15px "Libre Franklin",system-ui,sans-serif;cursor:pointer;text-decoration:none;min-height:40px;white-space:nowrap}
+.btn.ghost,button.ghost{background:transparent;color:var(--teal);border:1px solid var(--teal)}
 :focus-visible{outline:3px solid var(--claret);outline-offset:2px}
-.hero{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:20px;align-items:end}
-@media(max-width:760px){.hero{grid-template-columns:minmax(0,1fr)}}
-.huntbox{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}
-.huntbox p{margin:6px 0 0;font-size:13px;color:var(--mute)}
-.scroll{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)}
-table{border-collapse:collapse;width:100%;font-size:14px}
-th,td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
-th{font-weight:600;white-space:nowrap;background:var(--card);cursor:pointer;user-select:none}
-td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-td a{color:var(--teal);overflow-wrap:anywhere}
-.tag{display:inline-block;font-size:12px;font-weight:600;padding:2px 8px;border-radius:99px;white-space:nowrap;background:var(--line)}
-.AVAILABLE,.LIKELY_AVAILABLE{background:#0d768026;color:var(--teal)}
-.PENDING_DELETE,.REDEMPTION,.EXPIRED_GRACE{background:#990f3d1f;color:var(--claret)}
+.intro{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 16px;margin:14px 0 10px}
+h1{font-size:clamp(20px,2.6vw,26px);line-height:1.15;margin:0;font-weight:800;text-wrap:balance}
+h1 span{color:var(--teal)}
+.intro p{margin:0;color:var(--mute);font-size:13px;max-width:70ch}
+.stats{display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;margin:0 0 12px;padding-bottom:2px}
+.stat{flex:none;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:6px 12px;font-size:12px;color:var(--mute)}
+.stat b{font-size:17px;color:var(--ink);margin-right:4px;font-weight:800}
+.controls{position:sticky;top:0;z-index:5;background:var(--bg);padding:8px 0;border-bottom:1px solid var(--line);margin-bottom:12px}
+.row1{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.chips{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;flex:1 1 auto}
+.chip{flex:none;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:99px;padding:6px 12px;font:600 13px inherit;min-height:34px;cursor:pointer}
+.chip[aria-pressed=true]{background:var(--teal);border-color:var(--teal);color:#fff}
+select,input[type=text],input[type=number]{font:16px "Libre Franklin",system-ui,sans-serif;padding:7px 10px;border:1px solid var(--line);border-radius:8px;
+  background:var(--card);color:var(--ink);min-height:38px}
+#sort{flex:0 1 190px}
+.more{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-top:8px}
+.more[hidden]{display:none}
+.more label{display:flex;gap:6px;align-items:center;font-size:14px}
+.more input[type=number]{width:72px}
+.count{margin:0 0 10px;font-size:13px;color:var(--mute)}.count b{color:var(--ink)}
+#rows{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(min(100%,340px),1fr));align-items:start}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:10px}
+.top{display:flex;gap:10px;align-items:flex-start}
+.dom{font-weight:800;font-size:17px;line-height:1.25;overflow-wrap:anywhere;margin:0}
+.q{flex:none;margin-left:auto;text-align:center;border-radius:10px;padding:4px 8px;min-width:52px;line-height:1.1}
+.q b{display:block;font-size:20px}.q small{font-size:10px;font-weight:600;text-transform:none}
+.qhi{background:var(--tealbg);color:var(--teal)}.qmid{background:var(--line)}.qlo{background:var(--line);color:var(--mute)}
+.tag{display:inline-block;font-size:12px;font-weight:600;padding:2px 8px;border-radius:99px;background:var(--line);white-space:nowrap}
+.AVAILABLE,.LIKELY_AVAILABLE,.df{background:var(--tealbg);color:var(--teal)}
+.PENDING_DELETE,.REDEMPTION,.EXPIRED_GRACE{background:var(--claretbg);color:var(--claret)}
+.meta{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:13px;color:var(--mute)}
+.meta b{color:var(--ink);font-weight:600}
+.src{font-size:13px;border-top:1px solid var(--line);padding-top:8px;display:grid;gap:4px}
+.src .lbl{color:var(--mute);font-size:11px;font-weight:600}
+.src a{overflow-wrap:anywhere}
+.anchor{font-style:italic}
 .flag{font-size:12px;color:var(--claret)}
-.count{margin:0 0 8px;font-size:14px;color:var(--mute)}.count b{color:var(--ink)}
-.q{display:inline-block;min-width:38px;text-align:center;font-weight:800;border-radius:6px;padding:2px 6px}
-.qhi{background:#0d768026;color:var(--teal)}
-.anchor{font-style:italic}.muted{color:var(--mute)}a.bl{font-size:12px;white-space:nowrap}
-@media(max-width:820px){
-  .scroll{overflow:visible;border:0;background:none}
-  .scroll table,.scroll tbody{display:block}.scroll thead{display:none}
-  #rows tr{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;background:var(--card);border:1px solid var(--line);
-    border-radius:12px;padding:14px;margin-bottom:12px}
-  #rows td{display:block;border:0;padding:0;text-align:left;min-width:0}
-  #rows td:empty{display:none}
-  #rows td[data-l]:not([data-l=""])::before{content:attr(data-l);display:block;font-size:11px;font-weight:600;
-    color:var(--mute);text-transform:none;margin-bottom:1px}
-  #rows td.dom,#rows td[data-l="Linked from"],#rows td[data-l="Anchor text"],#rows td.act{grid-column:1/-1}
-  #rows td.dom b{font-size:18px}
-  #rows td.act .btn{width:100%;justify-content:center;min-height:44px;font-size:15px}
-  #rows td.empty{grid-column:1/-1}
-  .bar{gap:8px}.bar input[type=text]{flex:1 1 140px}.bar select{flex:1 1 160px}
-}.qmid{background:var(--line)}.qlo{color:var(--mute)}
-details summary{cursor:pointer;color:var(--mute);font-size:13px}
-details ul{margin:6px 0 0;padding-left:18px;font-size:13px}
-pre.log{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;max-height:220px;overflow:auto;font-size:13px;white-space:pre-wrap}
-form.custom{display:grid;gap:18px;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);background:var(--card);border:1px solid var(--line);border-radius:12px;padding:22px}
-@media(max-width:760px){form.custom{grid-template-columns:minmax(0,1fr)}}
-form.custom label.t{display:block;font-weight:600;margin:12px 0 4px}
-form.custom textarea,form.custom input[type=text],form.custom input[type=number]{width:100%;font:16px/1.4 inherit;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
-form.custom textarea{min-height:140px;font-family:ui-monospace,monospace;font-size:14px}
-.check{display:flex;gap:10px;align-items:flex-start;margin:10px 0}.check input{width:20px;height:20px;accent-color:var(--teal)}
+details summary{cursor:pointer;color:var(--mute);font-size:12px}
+details ul{margin:4px 0 0;padding-left:18px;font-size:13px}
+.acts{display:grid;grid-template-columns:1fr auto;gap:8px}
+.acts .btn{min-height:42px}
+.empty{padding:28px;text-align:center;color:var(--mute);grid-column:1/-1}
+pre.log{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;max-height:200px;overflow:auto;font-size:13px;white-space:pre-wrap}
+form.custom{display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px}
+form.custom label.t{display:block;font-weight:600;margin:10px 0 4px}
+form.custom textarea,form.custom input[type=text],form.custom input[type=number]{width:100%}
+form.custom textarea{min-height:120px;font:14px ui-monospace,monospace;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
+.check{display:flex;gap:10px;align-items:flex-start;margin:10px 0}
 .hint{font-size:13px;color:var(--mute);margin:4px 0 0}
-.errors{background:#990f3d14;border-left:4px solid var(--claret);padding:10px 14px;margin:14px 0;border-radius:6px}
+.errors{background:var(--claretbg);border-left:4px solid var(--claret);padding:10px 14px;margin:14px 0;border-radius:6px}
 .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--teal);border-radius:50%;animation:s 1s linear infinite;vertical-align:-2px;margin-right:6px}
 @keyframes s{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.spin{animation:none}}
-.empty{padding:28px;text-align:center;color:var(--mute)}
-footer{color:var(--mute);font-size:13px;padding:24px 0 40px}
+footer{color:var(--mute);font-size:12px;padding:20px 0 32px}
+@media(max-width:600px){.intro p{display:none}#sort{flex:1 1 100%}}
 </style></head><body><div class="wrap">
-<nav><b>dropfinder</b><a href="{{ url_for('index') }}" class="{{ 'on' if view=='feed' }}">Latest finds</a>
-<a href="{{ url_for('custom') }}" class="{{ 'on' if view=='custom' }}">Custom hunt</a></nav>
+<header><a class="logo" href="{{ url_for('index') }}">dropfinder</a>
+<nav><a href="{{ url_for('index') }}" class="{{ 'on' if view=='feed' }}">Finds</a><a href="{{ url_for('custom') }}" class="{{ 'on' if view=='custom' }}">Custom hunt</a></nav>
+{% if view == "feed" %}<form method="post" action="{{ url_for('hunt_auto') }}"><button type="submit" title="Fresh automatic hunt, about 5 minutes">Hunt now</button></form>{% endif %}
+</header>
 
 {% if view == "feed" %}
-<div class="hero">
-  <div><h1>Expired domains that still have <span>authority backlinks</span></h1>
-  <p class="lede">Found automatically, authority first. Every few hours dropfinder takes domains that already have strong
-  backlink profiles - the StableDomains quality drop feed, the Majestic Million and the top of Common Crawl's web graph -
-  finds the ones that are free or dropping, checks the Wayback Machine for a real site history, and scores each one 0-100.
-  Link discovery on Hacker News, Debian, EU research projects and ranked sites adds more.</p></div>
-  <form class="huntbox" method="post" action="{{ url_for('hunt_auto') }}">
-    <button type="submit">Hunt now</button>
-    <p>Runs a fresh automatic hunt on {{ limits.auto }} random ranked sites (about 5-8 minutes). No input needed.</p>
-  </form>
-</div>
+<div class="intro"><h1>Expired domains with <span>authority backlinks</span></h1>
+<p>Found automatically every few hours from strong backlink profiles, checked against registries and the Wayback Machine, scored 0-100.</p></div>
 <div class="stats">
-  <div class="stat"><b id="s-avail">-</b><span>available now</span></div>
-  <div class="stat"><b id="s-drop">-</b><span>dropping / expired</span></div>
-  <div class="stat"><b id="s-q60">-</b><span>quality 60+</span></div>
-  <div class="stat"><b id="s-total">-</b><span>tracked domains</span></div>
-  <div class="stat"><b id="s-upd">-</b><span>last auto-hunt</span></div>
+  <div class="stat"><b id="s-avail">-</b>available</div>
+  <div class="stat"><b id="s-drop">-</b>dropping</div>
+  <div class="stat"><b id="s-q60">-</b>quality 60+</div>
+  <div class="stat"><b id="s-total">-</b>tracked</div>
+  <div class="stat"><b id="s-upd">-</b>updated</div>
 </div>
-<div class="bar">
-  <div class="chips" id="chips"></div>
-  <input type="text" id="q" placeholder="Search domain" aria-label="Search domain">
-  <input type="text" id="tld" placeholder="TLDs e.g. com,org" aria-label="TLDs">
-  <select id="via" aria-label="Link source"><option value="">All sources</option><option value="stabledomains">Drop feed</option>
-    <option value="majestic">Majestic Million</option><option value="commoncrawl">Top web graph</option><option value="hackernews">Hacker News</option>
-    <option value="debian">Debian packages</option><option value="cordis">EU research projects</option>
-    <option value="crawl">Ranked sites</option><option value="wikipedia">Wikipedia</option></select>
-  <label>Min quality <input type="number" id="minscore" min="0" max="100" step="5" value="0"></label>
-  <label><input type="checkbox" id="dfonly"> Dofollow only</label>
-  <label><input type="checkbox" id="nospam" checked> Hide spammy</label>
-  <a class="btn small ghost" href="{{ url_for('feed_csv') }}">CSV</a>
+<div class="controls">
+  <div class="row1">
+    <div class="chips" id="chips"></div>
+    <select id="sort" aria-label="Sort by">
+      <option value="quality">Best quality</option><option value="drops">Dropping soonest</option>
+      <option value="ref_subnets">Most referring networks</option><option value="authority">Highest authority</option>
+      <option value="real_years">Longest real history</option><option value="price">Cheapest</option><option value="domain">A-Z</option></select>
+    <button type="button" class="ghost" id="moreBtn" aria-expanded="false" aria-controls="more">Filters</button>
+  </div>
+  <div class="more" id="more" hidden>
+    <input type="text" id="q" placeholder="Search domain" aria-label="Search domain">
+    <input type="text" id="tld" placeholder="TLDs e.g. com,org" aria-label="TLDs">
+    <select id="via" aria-label="Link source"><option value="">All sources</option><option value="stabledomains">Drop feed</option>
+      <option value="majestic">Majestic Million</option><option value="commoncrawl">Top web graph</option><option value="hackernews">Hacker News</option>
+      <option value="debian">Debian packages</option><option value="cordis">EU research projects</option>
+      <option value="crawl">Ranked sites</option><option value="wikipedia">Wikipedia</option></select>
+    <label>Min quality <input type="number" id="minscore" min="0" max="100" step="5" value="0"></label>
+    <label><input type="checkbox" id="dfonly"> Dofollow only</label>
+    <label><input type="checkbox" id="nospam" checked> Hide spammy</label>
+    <a class="btn ghost" href="{{ url_for('feed_csv') }}">Download CSV</a>
+  </div>
 </div>
 <p class="count" id="count" aria-live="polite"></p>
-<div class="scroll"><table><thead><tr id="thead"></tr></thead><tbody id="rows"><tr><td class="empty" colspan="11"><span class="spin"></span>Loading finds...</td></tr></tbody></table></div>
-<p id="more" hidden><button class="btn ghost" id="morebtn" type="button">Show more</button></p>
+<div id="rows"><div class="empty"><span class="spin"></span>Loading finds...</div></div>
+<p id="more2" hidden style="text-align:center"><button class="ghost" id="morebtn" type="button">Show more</button></p>
 
 {% elif view == "custom" %}
-<h1>Custom hunt</h1>
-<p class="lede">Optional extras. Everything here is automatic too: leave the seed box empty and dropfinder finds its own pages.</p>
+<div class="intro"><h1>Custom hunt</h1><p>Optional extras. Leave the seed box empty and dropfinder finds its own pages.</p></div>
 {% if errors %}<div class="errors">{% for e in errors %}<div>{{ e }}</div>{% endfor %}</div>{% endif %}
 <form class="custom" method="post" action="{{ url_for('run') }}">
   <div>
     <label class="t" for="auto_sites">Random ranked sites to scan</label>
     <input id="auto_sites" name="auto_sites" type="number" min="0" max="{{ limits.auto }}" value="{{ form.get('auto_sites', limits.auto) }}">
-    <p class="hint">Picked from the Tranco top-sites list; their oldest pages are read via sitemaps.</p>
     <label class="t" for="wiki_months">Random Wikipedia dead-link months</label>
     <input id="wiki_months" name="wiki_months" type="number" min="0" max="2" value="{{ form.get('wiki_months', 1) }}">
     <label class="t" for="seeds">Your own seed pages (optional, one per line)</label>
     <textarea id="seeds" name="seeds" placeholder="https://example.edu/resources/links">{{ form.get('seeds','') }}</textarea>
     <p class="hint">Up to {{ limits.seeds }}. robots.txt is obeyed, one request per second per site.</p>
-    <label class="check"><input type="checkbox" name="sitemaps" {{ 'checked' if form.get('sitemaps', 'on') }}> Read each seed site's oldest sitemap pages (finds far more dead links)</label>
+    <label class="check"><input type="checkbox" name="sitemaps" {{ 'checked' if form.get('sitemaps', 'on') }}> Read each seed site's oldest sitemap pages</label>
   </div>
   <div>
     <label class="t" for="wiki">Specific Wikipedia category (optional)</label>
@@ -418,34 +420,29 @@ footer{color:var(--mute);font-size:13px;padding:24px 0 40px}
     <label class="t" for="min_sources">Min. linking sites</label>
     <input id="min_sources" name="min_sources" type="number" min="1" max="10" value="{{ form.get('min_sources', 1) }}">
     <label class="check"><input type="checkbox" name="dofollow_only" {{ 'checked' if form.get('dofollow_only') }}> Dofollow links only</label>
-    <p style="margin-top:18px"><button type="submit">Start hunt</button></p>
+    <p style="margin-top:14px"><button type="submit">Start hunt</button></p>
     <p class="hint">{{ limits.per_hour }} hunts per hour per visitor. Up to {{ limits.domains }} domains checked per hunt.</p>
   </div>
 </form>
 
 {% else %}
-<h1>Hunting...</h1>
-<p id="status"><span class="spin"></span>Working. This usually takes 3-8 minutes; keep the page open or bookmark it.</p>
+<div class="intro"><h1>Hunting...</h1><p id="status"><span class="spin"></span>Usually 3-8 minutes. Keep this page open or bookmark it.</p></div>
 <div class="stats">
-  <div class="stat"><b id="links">-</b><span>outbound links</span></div>
-  <div class="stat"><b id="dofollow">-</b><span>dofollow links</span></div>
-  <div class="stat"><b id="domains">-</b><span>linked domains</span></div>
-  <div class="stat"><b id="found">-</b><span>candidates</span></div>
+  <div class="stat"><b id="links">-</b>links</div><div class="stat"><b id="dofollow">-</b>dofollow</div>
+  <div class="stat"><b id="domains">-</b>domains</div><div class="stat"><b id="found">-</b>candidates</div>
 </div>
 <pre class="log" id="log"></pre>
 <p id="actions" hidden><a class="btn ghost" href="{{ url_for('job_csv', jid=job.id) }}">Download CSV</a></p>
-<div class="scroll" id="tablewrap" hidden><table><thead><tr id="thead"></tr></thead><tbody id="rows"></tbody></table></div>
+<div id="rows"></div>
 {% endif %}
-<footer>Status comes from public DNS, RDAP, the Wayback Machine and StableDomains and can change quickly; confirm at checkout.
-Authority = Tranco top-sites rank of the linking site. "Dofollow" is read from page HTML: a strong filter, not a guarantee.
-Register links go to StableDomains (affiliate).</footer>
+<footer>Status from public DNS, RDAP, the Wayback Machine and StableDomains; it can change quickly, so confirm at checkout.
+Tap a source to open the linking page with the backlink highlighted. Register links go to StableDomains (affiliate).</footer>
 </div>
 <script>
 {
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   const $ = x => document.getElementById(x);
   const safeUrl = u => /^https?:\/\//i.test(String(u || ""));
-  const link = (u, t) => safeUrl(u) ? `<a href="${esc(u)}" rel="nofollow noopener" target="_blank">${esc(t ?? u)}</a>` : esc(t ?? u);
   const NICE = {AVAILABLE:"available",LIKELY_AVAILABLE:"likely available",PENDING_DELETE:"pending delete",REDEMPTION:"redemption",
     EXPIRED_GRACE:"expired (grace)",EXPIRING_SOON:"expiring soon",PARKED:"parked",DEAD_SITE:"dead site",REGISTERED:"registered"};
   const ORDER = {AVAILABLE:0,PENDING_DELETE:1,REDEMPTION:2,EXPIRED_GRACE:3,LIKELY_AVAILABLE:4,EXPIRING_SOON:5,PARKED:6,DEAD_SITE:7};
@@ -453,101 +450,104 @@ Register links go to StableDomains (affiliate).</footer>
   const VIA = {hackernews:"Hacker News", debian:"Debian", cordis:"EU project", crawl:"ranked site", wikipedia:"Wikipedia",
     stabledomains:"Drop feed", majestic:"Majestic Million", commoncrawl:"Top web graph"};
   const qClass = q => q >= 60 ? "qhi" : q >= 35 ? "qmid" : "qlo";
-  const viaTags = v => (v || "").split(",").filter(Boolean).map(x => `<span class="via">${esc(VIA[x] || x)}</span>`).join("");
-  const COLS = [["domain","Domain"],["status","Status"],["quality","Quality"],["ref_subnets","Ref. networks"],
-    ["authority","Authority"],["real_years","Real site (yrs)"],["dofollow_sources","Dofollow sites"],["expiry","Drops / expiry"],["sources","Source"],["anchor","Anchor text"],["buy",""]];
-  function rowHtml(r) {
-    const src = r.sources || [];
-    const items = src.map(s => `<li>${jumpLink(s)} <span class="tag">${esc(s.follow)}</span>${s.rank ? ` <span class="tag">#${esc(Number(s.rank).toLocaleString())}</span>` : ""}${s.anchor ? ` "${esc(s.anchor)}"` : ""}</li>`).join("");
-    const first = src[0] || {url: r.best_source_url, anchor: r.best_anchor};
-    const host = (() => { try { return new URL(first.url).hostname.replace(/^www\./, ""); } catch (e) { return first.url || ""; } })();
-    const flags = r.flags ? `<div class="flag">${esc(r.flags)}</div>` : "";
-    const price = r.sd_price ? ` $${esc(r.sd_price)}` : "";
-    const buy = safeUrl(r.buy_url) ? esc(r.buy_url) : "#";
-    const act = BUY.has(r.status) ? `<a class="btn small" href="${buy}" target="_blank" rel="noopener">Register${price}</a>`
-      : `<a class="btn small ghost" href="${buy}" target="_blank" rel="noopener">Check</a>`;
-    const why = (r.quality_reasons || []).map(x => `<li>${esc(x)}</li>`).join("");
-    const realY = r.real_years != null && r.real_years !== "" ? r.real_years : "";
-    return `<tr><td class="dom" data-l=""><b>${esc(r.domain)}</b>${flags}${why ? `<details><summary>why</summary><ul>${why}</ul></details>` : ""}</td>
-      <td data-l="Status"><span class="tag ${esc(r.status)}">${esc(NICE[r.status] || r.status)}</span></td>
-      <td class="n" data-l="Quality"><span class="q ${qClass(r.quality || 0)}">${r.quality != null ? esc(r.quality) : ""}</span></td>
-      <td class="n" data-l="Ref. networks">${r.ref_subnets ? esc(Number(r.ref_subnets).toLocaleString()) : ""}</td>
-      <td class="n" data-l="Authority">${r.authority != null ? esc(r.authority) : ""}</td>
-      <td class="n" data-l="Real site (yrs)">${esc(realY)}</td>
-      <td class="n" data-l="Dofollow sites">${r.dofollow_sources ? esc(r.dofollow_sources) : ""}</td>
-      <td data-l="Drops / expiry">${esc((r.expiry || "").slice(0, 10))}</td>
-      <td data-l="Linked from">${viaTags(r.via)}${first.url ? jumpLink(first, host + " ↗") : ""}${src.length > 1 ? `<details><summary>${src.length} linking pages</summary><ul>${items}</ul></details>` : ""}</td>
-      <td data-l="Anchor text">${anchorCell(r)}</td>
-      <td class="act" data-l="">${act}</td></tr>`;
-  }
-  // Opens the linking page scrolled to the backlink, highlighted (URL text fragment: #:~:text=...).
+  const num = v => (v === null || v === undefined || v === "") ? null : Number(v);
+  // open the linking page scrolled to the backlink, highlighted (#:~:text=)
   const frag = t => encodeURIComponent(t).replace(/-/g, "%2D").replace(/,/g, "%2C");
   function jumpUrl(s) {
-    if (!safeUrl(s.url)) return "";
+    if (!s || !safeUrl(s.url)) return "";
     const base = s.url.split("#")[0];
     let t = (s.anchor || "").replace(/\s+/g, " ").trim();
     if (t.length > 70) t = t.slice(0, 70).replace(/\s+\S*$/, "");
     return t.length >= 3 && t !== "Wayback history" && s.via !== "wikipedia" ? `${base}#:~:text=${frag(t)}` : base;
   }
-  const jumpLink = (s, label) => {
-    const u = jumpUrl(s);
-    return u ? `<a href="${esc(u)}" target="_blank" rel="noopener nofollow">${esc(label ?? s.url)}</a>` : esc(label ?? s.url);
-  };
-  function anchorCell(r) {
-    const src = (r.sources || []).filter(s => s.anchor && s.anchor !== "Wayback history");
-    const best = src.find(s => s.follow === "dofollow") || src[0];
-    const bl = `<a class="bl" href="https://majestic.com/reports/site-explorer?q=${encodeURIComponent(r.domain)}" target="_blank" rel="noopener nofollow">Backlinks ↗</a>`;
-    if (!best) return `<span class="muted">-</span><div>${bl}</div>`;
-    const more = src.length > 1 ? `<details><summary>${src.length} anchors</summary><ul>${src.map(s =>
-      `<li>${jumpLink(s, '"' + s.anchor + '"')} <span class="tag">${esc(s.follow || "?")}</span></li>`).join("")}</ul></details>` : "";
-    return `<span class="anchor">${jumpLink(best, '"' + best.anchor + '"')}</span> <span class="tag ${best.follow === "dofollow" ? "AVAILABLE" : ""}">${esc(best.follow || "?")}</span>`
-      + (best.rank ? ` <span class="tag">#${esc(Number(best.rank).toLocaleString())}</span>` : "") + more + `<div>${bl}</div>`;
+  const hostOf = u => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch (e) { return u || ""; } };
+  function card(r) {
+    const src = (r.sources || []).filter(s => s.url);
+    const anchored = src.filter(s => s.anchor && s.anchor !== "Wayback history");
+    const best = anchored.find(s => s.follow === "dofollow") || anchored[0] || src[0];
+    const q = r.quality != null ? r.quality : null;
+    const meta = [];
+    if (num(r.ref_subnets)) meta.push(`<span><b>${esc(Number(r.ref_subnets).toLocaleString())}</b> ref. networks</span>`);
+    if (num(r.authority) !== null) meta.push(`<span>authority <b>${esc(r.authority)}</b>/10</span>`);
+    if (num(r.real_years)) meta.push(`<span><b>${esc(r.real_years)}</b>y real site</span>`);
+    else if (num(r.wb_years)) meta.push(`<span><b>${esc(r.wb_years)}</b>y archived</span>`);
+    if (num(r.dofollow_sources)) meta.push(`<span><b>${esc(r.dofollow_sources)}</b> dofollow</span>`);
+    if (r.expiry) meta.push(`<span>${r.status === "PENDING_DELETE" ? "drops" : "expiry"} <b>${esc(String(r.expiry).slice(0, 10))}</b></span>`);
+    const vias = (r.via || "").split(",").filter(Boolean).map(v => VIA[v] || v).join(", ");
+    let srcHtml = "";
+    if (best && best.anchor && best.anchor !== "Wayback history") {
+      srcHtml = `<span class="lbl">Backlink${vias ? " - " + esc(vias) : ""}</span>
+        <a href="${esc(jumpUrl(best))}" target="_blank" rel="noopener nofollow"><span class="anchor">"${esc(best.anchor)}"</span> on ${esc(hostOf(best.url))} ↗</a>
+        <span><span class="tag ${best.follow === "dofollow" ? "df" : ""}">${esc(best.follow || "link")}</span>${best.rank ? ` <span class="tag">site #${esc(Number(best.rank).toLocaleString())}</span>` : ""}</span>`;
+    } else if (best) {
+      srcHtml = `<span class="lbl">Found via ${esc(vias || "link")}</span><a href="${esc(jumpUrl(best))}" target="_blank" rel="noopener nofollow">${esc(hostOf(best.url))} ↗</a>`;
+    }
+    const others = anchored.filter(s => s !== best);
+    if (others.length) srcHtml += `<details><summary>${others.length} more backlink${others.length > 1 ? "s" : ""}</summary><ul>${others.map(s =>
+      `<li><a href="${esc(jumpUrl(s))}" target="_blank" rel="noopener nofollow">"${esc(s.anchor)}"</a> on ${esc(hostOf(s.url))} <span class="tag">${esc(s.follow || "")}</span></li>`).join("")}</ul></details>`;
+    const why = (r.quality_reasons || []).map(x => `<li>${esc(x)}</li>`).join("");
+    const buy = safeUrl(r.buy_url) ? esc(r.buy_url) : "#";
+    const price = r.sd_price ? ` $${esc(r.sd_price)}` : "";
+    const main = BUY.has(r.status) ? `<a class="btn" href="${buy}" target="_blank" rel="noopener">Register${price}</a>`
+      : `<a class="btn ghost" href="${buy}" target="_blank" rel="noopener">${r.status === "PENDING_DELETE" || r.status === "REDEMPTION" ? "Watch / backorder" : "Check"}</a>`;
+    return `<article class="card">
+      <div class="top"><div><p class="dom">${esc(r.domain)}</p>
+        <span class="tag ${esc(r.status)}">${esc(NICE[r.status] || r.status)}</span>${r.flags ? ` <span class="flag">${esc(r.flags)}</span>` : ""}</div>
+        ${q !== null ? `<div class="q ${qClass(q)}"><b>${esc(q)}</b><small>quality</small></div>` : ""}</div>
+      ${meta.length ? `<div class="meta">${meta.join("")}</div>` : ""}
+      ${why ? `<details><summary>Why this score</summary><ul>${why}</ul></details>` : ""}
+      ${srcHtml ? `<div class="src">${srcHtml}</div>` : ""}
+      <div class="acts">${main}<a class="btn ghost" href="https://majestic.com/reports/site-explorer?q=${encodeURIComponent(r.domain)}" target="_blank" rel="noopener nofollow">Backlinks</a></div>
+    </article>`;
   }
-  function head() { $("thead").innerHTML = COLS.map(([k, t]) => `<th data-k="${k}">${t}</th>`).join(""); }
 
   {% if view == "feed" %}
-  let all = [], shown = 200, sortKey = null, sortDir = 1;
+  let all = [], shown = 60;
   const status = new Set();
   const GROUPS = {"Available":["AVAILABLE","LIKELY_AVAILABLE"],"Dropping":["PENDING_DELETE","REDEMPTION","EXPIRED_GRACE"],
     "Expiring":["EXPIRING_SOON"],"Parked / dead":["PARKED","DEAD_SITE"]};
   const DEFAULT_ON = ["Available", "Dropping"];
   $("chips").innerHTML = Object.keys(GROUPS).map(g => `<button type="button" class="chip" aria-pressed="${DEFAULT_ON.includes(g)}" data-g="${g}">${g}</button>`).join("");
   DEFAULT_ON.forEach(g => GROUPS[g].forEach(s => status.add(s)));
+  const SORTS = {
+    quality: (a, b) => (b.quality || 0) - (a.quality || 0),
+    drops: (a, b) => (a.expiry || "9999").localeCompare(b.expiry || "9999"),
+    ref_subnets: (a, b) => (num(b.ref_subnets) || 0) - (num(a.ref_subnets) || 0),
+    authority: (a, b) => (num(b.authority) || 0) - (num(a.authority) || 0),
+    real_years: (a, b) => (num(b.real_years) || num(b.wb_years) || 0) - (num(a.real_years) || num(a.wb_years) || 0),
+    price: (a, b) => (parseFloat(a.sd_price) || 1e9) - (parseFloat(b.sd_price) || 1e9),
+    domain: (a, b) => a.domain.localeCompare(b.domain),
+  };
   function render() {
     const q = $("q").value.trim().toLowerCase();
     const tl = $("tld").value.toLowerCase().split(",").map(s => s.trim().replace(/^\./, "")).filter(Boolean);
     const ms = parseFloat($("minscore").value) || 0;
-    let rows = all.filter(r => (!status.size || status.has(r.status)) && (!q || r.domain.includes(q))
+    const rows = all.filter(r => (!status.size || status.has(r.status)) && (!q || r.domain.includes(q))
       && (!tl.length || tl.includes(r.domain.split(".").slice(1).join(".")) || tl.includes(r.domain.split(".").pop()))
       && (r.quality || 0) >= ms && (!$("dfonly").checked || r.dofollow_sources > 0)
-      && (!$("nospam").checked || !(r.flags || "").includes("spammy"))
-      && (!$("via").value || (r.via || "").split(",").includes($("via").value)));
-    if (sortKey) rows = rows.slice().sort((a, b) => {
-      let x = a[sortKey] ?? "", y = b[sortKey] ?? "";
-      if (sortKey === "status") { x = ORDER[x] ?? 9; y = ORDER[y] ?? 9; }
-      if (x === "" && y !== "") return 1;
-      if (y === "" && x !== "") return -1;
-      return (x > y ? 1 : x < y ? -1 : 0) * sortDir; });
-    $("rows").innerHTML = rows.length ? rows.slice(0, shown).map(rowHtml).join("")
-      : `<tr><td class="empty" colspan="11">${all.length ? "Nothing matches these filters." : "No finds yet - the first automatic hunt runs within a few hours. Press Hunt now to run one."}</td></tr>`;
-    $("more").hidden = rows.length <= shown;
-    $("count").innerHTML = `Showing <b>${Math.min(rows.length, shown)}</b> of <b>${rows.length}</b> matching finds (${all.length} tracked)`;
+      && (!$("nospam").checked || !(r.flags || "").includes("spam"))
+      && (!$("via").value || (r.via || "").split(",").includes($("via").value)))
+      .sort((a, b) => SORTS[$("sort").value](a, b) || (ORDER[a.status] ?? 9) - (ORDER[b.status] ?? 9));
+    $("rows").innerHTML = rows.length ? rows.slice(0, shown).map(card).join("")
+      : `<div class="empty">${all.length ? "Nothing matches these filters." : "No finds yet - press Hunt now or wait for the next automatic hunt."}</div>`;
+    $("more2").hidden = rows.length <= shown;
+    $("count").innerHTML = `Showing <b>${Math.min(rows.length, shown)}</b> of <b>${rows.length}</b> matching finds`;
   }
   $("chips").addEventListener("click", e => { const b = e.target.closest(".chip"); if (!b) return;
     const on = b.getAttribute("aria-pressed") !== "true"; b.setAttribute("aria-pressed", String(on));
-    GROUPS[b.dataset.g].forEach(s => on ? status.add(s) : status.delete(s)); shown = 200; render(); });
-  ["q", "tld", "minscore", "dfonly", "nospam", "via"].forEach(id => ["input", "change"].forEach(ev =>
-    $(id).addEventListener(ev, () => { shown = 200; render(); })));
-  head();
-  $("thead").addEventListener("click", e => { const k = e.target.dataset.k; if (!k || k === "sources" || k === "buy" || k === "anchor") return;
-    sortDir = sortKey === k ? -sortDir : (["domain", "status", "expiry", "best_source_rank", "cc_rank"].includes(k) ? 1 : -1); sortKey = k; render(); });
-  $("morebtn").addEventListener("click", () => { shown += 200; render(); });
+    GROUPS[b.dataset.g].forEach(s => on ? status.add(s) : status.delete(s)); shown = 60; render(); });
+  ["q", "tld", "minscore", "dfonly", "nospam", "via", "sort"].forEach(id => ["input", "change"].forEach(ev =>
+    $(id).addEventListener(ev, () => { shown = 60; render(); })));
+  $("moreBtn").addEventListener("click", () => { const open = $("more").hidden; $("more").hidden = !open;
+    $("moreBtn").setAttribute("aria-expanded", String(open)); $("moreBtn").textContent = open ? "Hide filters" : "Filters"; });
+  $("morebtn").addEventListener("click", () => { shown += 60; render(); });
   fetch("{{ url_for('feed_json') }}").then(r => r.json()).then(d => {
     all = d.rows || [];
     $("s-avail").textContent = all.filter(r => BUY.has(r.status)).length;
-    $("s-drop").textContent = all.filter(r => ["PENDING_DELETE", "REDEMPTION", "EXPIRED_GRACE", "EXPIRING_SOON"].includes(r.status)).length;
+    $("s-drop").textContent = all.filter(r => ["PENDING_DELETE", "REDEMPTION", "EXPIRED_GRACE"].includes(r.status)).length;
     $("s-total").textContent = all.length;
     $("s-q60").textContent = all.filter(r => (r.quality || 0) >= 60).length;
+    $("s-upd").textContent = d.updated ? new Date(d.updated).toLocaleString([], {dateStyle: "short", timeStyle: "short"}) : "pending";
     const vc = {};
     all.forEach(r => (r.via || "").split(",").filter(Boolean).forEach(v => vc[v] = (vc[v] || 0) + 1));
     [...$("via").options].forEach(o => {
@@ -557,12 +557,10 @@ Register links go to StableDomains (affiliate).</footer>
       o.textContent = n ? `${o.dataset.name} (${n})` : `${o.dataset.name} (0 - next hunt)`;
       o.disabled = !n;
     });
-    $("s-upd").textContent = d.updated ? new Date(d.updated).toLocaleString([], {dateStyle: "short", timeStyle: "short"}) : "pending";
     render();
-  }).catch(() => { $("rows").innerHTML = `<tr><td class="empty" colspan="11">Couldn't load finds. Refresh to try again.</td></tr>`; });
+  }).catch(() => { $("rows").innerHTML = `<div class="empty">Couldn't load finds. Refresh to try again.</div>`; });
   {% elif view == "job" %}
   const id = {{ job.id|tojson }};
-  head();
   async function poll() {
     let j;
     try { j = await (await fetch(`/job/${id}.json`)).json(); } catch (e) { return setTimeout(poll, 4000); }
@@ -571,7 +569,7 @@ Register links go to StableDomains (affiliate).</footer>
     if (j.state === "done") {
       $("status").textContent = j.rows.length ? "Done. Best candidates first." : "Done. Nothing free or dropping this time - press Hunt now again for a new random sample.";
       $("found").textContent = j.rows.length; $("actions").hidden = false;
-      if (j.rows.length) { $("tablewrap").hidden = false; $("rows").innerHTML = j.rows.map(rowHtml).join(""); }
+      $("rows").innerHTML = j.rows.map(card).join("");
     } else if (j.state === "error") { $("status").textContent = "The hunt failed - see the log."; $("actions").hidden = false; }
     else setTimeout(poll, 2500);
   }
