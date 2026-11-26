@@ -24,8 +24,8 @@ Run it by hand from the repo's Actions tab: "auto-hunt" > Run workflow.
 The web app reads `data/candidates.json` from GitHub (`DATA_URL`), so new finds appear without redeploying.
 
 ## Optional settings
-- `OPR_API_KEY` (GitHub secret and/or Render env var): free Open PageRank key from domcop.com/openpagerank,
-  adds a PageRank column.
+- `OPR_API_KEY` (GitHub secret and/or Render env var): free Open PageRank key from keywordseverywhere.com/openpagerank,
+  adds PageRank (0-10) and referring-domain columns (30,000 domains/month free).
 - `SD_REF`: StableDomains affiliate code for Register links (default wfmff7tz).
 - Web limits: `AUTO_SITES=40`, `MAX_DOMAINS=600`, `JOBS_PER_IP_PER_HOUR=4`, `MAX_RUNNING_JOBS=1`.
 

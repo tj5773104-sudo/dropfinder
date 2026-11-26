@@ -350,7 +350,7 @@ footer{color:var(--mute);font-size:13px;padding:24px 0 40px}
   <label><input type="checkbox" id="nospam" checked> Hide spammy</label>
   <a class="btn small ghost" href="{{ url_for('feed_csv') }}">CSV</a>
 </div>
-<div class="scroll"><table><thead><tr id="thead"></tr></thead><tbody id="rows"><tr><td class="empty" colspan="9"><span class="spin"></span>Loading finds...</td></tr></tbody></table></div>
+<div class="scroll"><table><thead><tr id="thead"></tr></thead><tbody id="rows"><tr><td class="empty" colspan="11"><span class="spin"></span>Loading finds...</td></tr></tbody></table></div>
 <p id="more" hidden><button class="btn ghost" id="morebtn" type="button">Show more</button></p>
 
 {% elif view == "custom" %}
@@ -412,7 +412,7 @@ Register links go to StableDomains (affiliate).</footer>
   const ORDER = {AVAILABLE:0,PENDING_DELETE:1,REDEMPTION:2,EXPIRED_GRACE:3,LIKELY_AVAILABLE:4,EXPIRING_SOON:5,PARKED:6,DEAD_SITE:7};
   const BUY = new Set(["AVAILABLE","LIKELY_AVAILABLE"]);
   const COLS = [["domain","Domain"],["status","Status"],["score","Score"],["dofollow_sources","Dofollow sites"],
-    ["best_source_rank","Top linker rank"],["wb_years","Age (yrs)"],["expiry","Expiry"],["sources","Linked from"],["buy",""]];
+    ["best_source_rank","Top linker rank"],["opr","PageRank"],["ref_domains","Ref. domains"],["wb_years","Age (yrs)"],["expiry","Expiry"],["sources","Linked from"],["buy",""]];
   function rowHtml(r) {
     const src = r.sources || [];
     const items = src.map(s => `<li>${link(s.url)} <span class="tag">${esc(s.follow)}</span>${s.rank ? ` <span class="tag">#${esc(Number(s.rank).toLocaleString())}</span>` : ""}${s.anchor ? ` "${esc(s.anchor)}"` : ""}</li>`).join("");
@@ -426,6 +426,7 @@ Register links go to StableDomains (affiliate).</footer>
       <td><span class="tag ${esc(r.status)}">${esc(NICE[r.status] || r.status)}</span></td>
       <td class="n">${esc(r.score)}</td><td class="n">${esc(r.dofollow_sources)}</td>
       <td class="n">${r.best_source_rank ? "#" + esc(Number(r.best_source_rank).toLocaleString()) : ""}</td>
+      <td class="n">${r.opr != null ? esc(r.opr) : ""}</td><td class="n">${r.ref_domains ? esc(Number(r.ref_domains).toLocaleString()) : ""}</td>
       <td class="n">${r.wb_years ? esc(r.wb_years) : ""}</td><td>${esc((r.expiry || "").slice(0, 10))}</td>
       <td>${link(first)}${src.length > 1 ? `<details><summary>${src.length} linking pages</summary><ul>${items}</ul></details>` : ""}</td>
       <td>${act}</td></tr>`;
@@ -455,7 +456,7 @@ Register links go to StableDomains (affiliate).</footer>
       if (y === "" && x !== "") return -1;
       return (x > y ? 1 : x < y ? -1 : 0) * sortDir; });
     $("rows").innerHTML = rows.length ? rows.slice(0, shown).map(rowHtml).join("")
-      : `<tr><td class="empty" colspan="9">${all.length ? "Nothing matches these filters." : "No finds yet - the first automatic hunt runs within a few hours. Press Hunt now to run one."}</td></tr>`;
+      : `<tr><td class="empty" colspan="11">${all.length ? "Nothing matches these filters." : "No finds yet - the first automatic hunt runs within a few hours. Press Hunt now to run one."}</td></tr>`;
     $("more").hidden = rows.length <= shown;
   }
   $("chips").addEventListener("click", e => { const b = e.target.closest(".chip"); if (!b) return;
@@ -473,7 +474,7 @@ Register links go to StableDomains (affiliate).</footer>
     $("s-total").textContent = all.length;
     $("s-upd").textContent = d.updated ? new Date(d.updated).toLocaleString([], {dateStyle: "short", timeStyle: "short"}) : "pending";
     render();
-  }).catch(() => { $("rows").innerHTML = `<tr><td class="empty" colspan="9">Couldn't load finds. Refresh to try again.</td></tr>`; });
+  }).catch(() => { $("rows").innerHTML = `<tr><td class="empty" colspan="11">Couldn't load finds. Refresh to try again.</td></tr>`; });
   {% elif view == "job" %}
   const id = {{ job.id|tojson }};
   head();

@@ -313,18 +313,24 @@ def score_domain(records):
 
 
 def open_pagerank(domains, key, session):
-    """Open PageRank (0-10) for domains. Free key at https://www.domcop.com/openpagerank/"""
+    """Open PageRank (0-10) + referring domains from Keywords Everywhere (free key: 30k domains/month).
+    Returns {domain: {"opr": float, "ref_domains": int}}."""
     out = {}
     if not key:
         return out
+    api = os.environ.get("OPR_API_URL", "https://openpagerank.keywordseverywhere.com") + "/v1/domains/bulk"
     for i in range(0, len(domains), 100):
         chunk = domains[i:i + 100]
         try:
-            r = session.get("https://openpagerank.com/api/v1.0/getPageRank",
-                            params=[("domains[]", d) for d in chunk], headers={"API-OPR": key}, timeout=30)
-            for it in r.json().get("response", []):
-                if str(it.get("status_code")) == "200" and it.get("page_rank_decimal") not in (None, ""):
-                    out[it["domain"]] = float(it["page_rank_decimal"])
+            r = session.post(api, json={"domains": chunk, "include_history": False}, timeout=60,
+                             headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+            if r.status_code != 200:
+                continue
+            for it in r.json().get("results", []):
+                d = str(it.get("domain", "")).lower()
+                if d and it.get("open_page_rank") is not None:
+                    out[d] = {"opr": round(float(it["open_page_rank"]), 2),
+                              "ref_domains": int(it.get("referring_domains") or 0)}
         except (requests.RequestException, ValueError, TypeError):
             pass
     return out
@@ -750,7 +756,7 @@ BUYABLE = {"AVAILABLE", "LIKELY_AVAILABLE"}
 
 # --------------------------------------------------------------------------- library api
 CSV_COLS = ["domain", "status", "score", "dofollow_sources", "nofollow_only_sources", "edu_gov_sources",
-            "best_source_rank", "opr", "expiry", "dns", "site", "wb_first", "wb_last", "wb_years", "wb_months",
+            "best_source_rank", "opr", "ref_domains", "expiry", "dns", "site", "wb_first", "wb_last", "wb_years", "wb_months",
             "sd_available", "sd_price", "flags", "best_source_url", "best_anchor", "link_target_url", "buy_url",
             "more_sources", "first_seen", "last_checked"]
 
@@ -952,11 +958,13 @@ def enrich(rows, wayback=False, wayback_top=100, verify=False, opr_key=None, log
                 time.sleep(0.5)
         rows[:] = [r for r in rows if r["status"] != "REGISTERED" or include_registered]
     if opr_key and rows:
-        log("Fetching Open PageRank...")
-        pr = open_pagerank([r["domain"] for r in rows[:1000]], opr_key, session)
+        need = [r["domain"] for r in rows if r["status"] != "REGISTERED" and "opr" not in r][:1500]
+        log(f"Fetching Open PageRank for {len(need)} domains...")
+        pr = open_pagerank(need, opr_key, session)
         for r in rows:
             if r["domain"] in pr:
-                r["opr"] = pr[r["domain"]]
+                r.update(pr[r["domain"]])
+        log(f"  got scores for {len(pr)}")
     rows.sort(key=lambda r: (PRIORITY.get(r["status"], 9), -r["score"]))
 
 
@@ -1007,7 +1015,7 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
             if prev.get("score", 0) > r["score"]:
                 r["score"], r["sources"] = prev["score"], prev.get("sources", r["sources"])
                 r["dofollow_sources"] = max(r["dofollow_sources"], prev.get("dofollow_sources", 0))
-            for k in ("wb_first", "wb_last", "wb_years", "wb_months", "opr"):
+            for k in ("wb_first", "wb_last", "wb_years", "wb_months", "opr", "ref_domains"):
                 if k not in r and k in prev:
                     r[k] = prev[k]
         old[r["domain"]] = r
