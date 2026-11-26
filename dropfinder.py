@@ -195,7 +195,7 @@ def fetch(url, session, timeout=15, max_bytes=2_000_000, url_ok=None, kinds=("ht
     """GET a URL. Returns (text, headers, final_url) or None. Content-type must contain one of `kinds`
     (None = anything). If url_ok is given, redirects are followed by hand and every hop must pass it."""
     for _ in range(6):
-        r = session.get(url, timeout=timeout, stream=True, allow_redirects=url_ok is None)
+        r = session.get(url, timeout=(6, timeout), stream=True, allow_redirects=url_ok is None)
         if url_ok is not None and r.is_redirect:
             nxt = urljoin(url, r.headers.get("location", ""))
             r.close()
@@ -366,9 +366,12 @@ class Crawler:
         self.s.max_redirects = 5
         self.delay, self.robots, self.last, self.lock = delay, {}, {}, threading.Lock()
         self.public_only, self.deadline = public_only, deadline
+        self._local = threading.local()
 
     def expired(self):
-        return self.deadline is not None and time.time() > self.deadline
+        now = time.time()
+        site_dl = getattr(self._local, "site_deadline", None)
+        return (self.deadline is not None and now > self.deadline) or (site_dl is not None and now > site_dl)
 
     def robots_for(self, url):
         u = urlparse(url)
@@ -461,14 +464,24 @@ class Crawler:
                 break
         return picked
 
-    def crawl_site(self, root, old_k=12, fallback_pages=8):
-        """Old pages from the sitemap (best for dead links) plus the homepage; falls back to a shallow crawl."""
+    def crawl_site(self, root, old_k=12, fallback_pages=8, site_budget=90):
+        """Old pages from the sitemap (best for dead links) plus the homepage; falls back to a shallow crawl.
+        Gives up on a site after site_budget seconds so slow sites can't stall a run."""
+        self._local.site_deadline = time.time() + site_budget
+        try:
+            return self._crawl_site(root, old_k, fallback_pages)
+        finally:
+            self._local.site_deadline = None
+
+    def _crawl_site(self, root, old_k, fallback_pages):
         if not root.startswith(("http://", "https://")):
             root = "https://" + root.strip("/") + "/"
         out = []
         pages = self.old_pages(root, k=old_k) if old_k else []
         if pages:
             for p in pages + [root]:
+                if self.expired():
+                    break
                 res = self.get(p)
                 if res:
                     out.extend(extract_links(res[0], res[2], res[1])[0])
