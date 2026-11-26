@@ -320,7 +320,8 @@ td a{color:var(--teal);overflow-wrap:anywhere}
 .flag{font-size:12px;color:var(--claret)}
 .count{margin:0 0 8px;font-size:14px;color:var(--mute)}.count b{color:var(--ink)}
 .q{display:inline-block;min-width:38px;text-align:center;font-weight:800;border-radius:6px;padding:2px 6px}
-.qhi{background:#0d768026;color:var(--teal)}.qmid{background:var(--line)}.qlo{color:var(--mute)}
+.qhi{background:#0d768026;color:var(--teal)}
+.anchor{font-style:italic}.muted{color:var(--mute)}a.bl{font-size:12px;white-space:nowrap}.qmid{background:var(--line)}.qlo{color:var(--mute)}
 details summary{cursor:pointer;color:var(--mute);font-size:13px}
 details ul{margin:6px 0 0;padding-left:18px;font-size:13px}
 pre.log{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;max-height:220px;overflow:auto;font-size:13px;white-space:pre-wrap}
@@ -373,7 +374,7 @@ footer{color:var(--mute);font-size:13px;padding:24px 0 40px}
   <a class="btn small ghost" href="{{ url_for('feed_csv') }}">CSV</a>
 </div>
 <p class="count" id="count" aria-live="polite"></p>
-<div class="scroll"><table><thead><tr id="thead"></tr></thead><tbody id="rows"><tr><td class="empty" colspan="10"><span class="spin"></span>Loading finds...</td></tr></tbody></table></div>
+<div class="scroll"><table><thead><tr id="thead"></tr></thead><tbody id="rows"><tr><td class="empty" colspan="11"><span class="spin"></span>Loading finds...</td></tr></tbody></table></div>
 <p id="more" hidden><button class="btn ghost" id="morebtn" type="button">Show more</button></p>
 
 {% elif view == "custom" %}
@@ -439,7 +440,7 @@ Register links go to StableDomains (affiliate).</footer>
   const qClass = q => q >= 60 ? "qhi" : q >= 35 ? "qmid" : "qlo";
   const viaTags = v => (v || "").split(",").filter(Boolean).map(x => `<span class="via">${esc(VIA[x] || x)}</span>`).join("");
   const COLS = [["domain","Domain"],["status","Status"],["quality","Quality"],["ref_subnets","Ref. networks"],
-    ["authority","Authority"],["real_years","Real site (yrs)"],["dofollow_sources","Dofollow sites"],["expiry","Drops / expiry"],["sources","Source"],["buy",""]];
+    ["authority","Authority"],["real_years","Real site (yrs)"],["dofollow_sources","Dofollow sites"],["expiry","Drops / expiry"],["sources","Source"],["anchor","Anchor text"],["buy",""]];
   function rowHtml(r) {
     const src = r.sources || [];
     const items = src.map(s => `<li>${link(s.url)} <span class="tag">${esc(s.follow)}</span>${s.rank ? ` <span class="tag">#${esc(Number(s.rank).toLocaleString())}</span>` : ""}${s.anchor ? ` "${esc(s.anchor)}"` : ""}</li>`).join("");
@@ -460,7 +461,18 @@ Register links go to StableDomains (affiliate).</footer>
       <td class="n">${r.dofollow_sources ? esc(r.dofollow_sources) : ""}</td>
       <td>${esc((r.expiry || "").slice(0, 10))}</td>
       <td>${viaTags(r.via)}${link(first)}${src.length > 1 ? `<details><summary>${src.length} linking pages</summary><ul>${items}</ul></details>` : ""}</td>
+      <td>${anchorCell(r)}</td>
       <td>${act}</td></tr>`;
+  }
+  function anchorCell(r) {
+    const src = (r.sources || []).filter(s => s.anchor && s.anchor !== "Wayback history");
+    const best = src.find(s => s.follow === "dofollow") || src[0];
+    const bl = `<a class="bl" href="https://majestic.com/reports/site-explorer?q=${encodeURIComponent(r.domain)}" target="_blank" rel="noopener nofollow">Backlinks ↗</a>`;
+    if (!best) return `<span class="muted">-</span><div>${bl}</div>`;
+    const more = src.length > 1 ? `<details><summary>${src.length} anchors</summary><ul>${src.map(s =>
+      `<li>"${esc(s.anchor)}" <span class="tag">${esc(s.follow || "?")}</span></li>`).join("")}</ul></details>` : "";
+    return `<span class="anchor">"${esc(best.anchor)}"</span> <span class="tag ${best.follow === "dofollow" ? "AVAILABLE" : ""}">${esc(best.follow || "?")}</span>`
+      + (best.rank ? ` <span class="tag">#${esc(Number(best.rank).toLocaleString())}</span>` : "") + more + `<div>${bl}</div>`;
   }
   function head() { $("thead").innerHTML = COLS.map(([k, t]) => `<th data-k="${k}">${t}</th>`).join(""); }
 
@@ -488,7 +500,7 @@ Register links go to StableDomains (affiliate).</footer>
       if (y === "" && x !== "") return -1;
       return (x > y ? 1 : x < y ? -1 : 0) * sortDir; });
     $("rows").innerHTML = rows.length ? rows.slice(0, shown).map(rowHtml).join("")
-      : `<tr><td class="empty" colspan="10">${all.length ? "Nothing matches these filters." : "No finds yet - the first automatic hunt runs within a few hours. Press Hunt now to run one."}</td></tr>`;
+      : `<tr><td class="empty" colspan="11">${all.length ? "Nothing matches these filters." : "No finds yet - the first automatic hunt runs within a few hours. Press Hunt now to run one."}</td></tr>`;
     $("more").hidden = rows.length <= shown;
     $("count").innerHTML = `Showing <b>${Math.min(rows.length, shown)}</b> of <b>${rows.length}</b> matching finds (${all.length} tracked)`;
   }
@@ -498,7 +510,7 @@ Register links go to StableDomains (affiliate).</footer>
   ["q", "tld", "minscore", "dfonly", "nospam", "via"].forEach(id => ["input", "change"].forEach(ev =>
     $(id).addEventListener(ev, () => { shown = 200; render(); })));
   head();
-  $("thead").addEventListener("click", e => { const k = e.target.dataset.k; if (!k || k === "sources" || k === "buy") return;
+  $("thead").addEventListener("click", e => { const k = e.target.dataset.k; if (!k || k === "sources" || k === "buy" || k === "anchor") return;
     sortDir = sortKey === k ? -sortDir : (["domain", "status", "expiry", "best_source_rank", "cc_rank"].includes(k) ? 1 : -1); sortKey = k; render(); });
   $("morebtn").addEventListener("click", () => { shown += 200; render(); });
   fetch("{{ url_for('feed_json') }}").then(r => r.json()).then(d => {
@@ -509,7 +521,7 @@ Register links go to StableDomains (affiliate).</footer>
     $("s-q60").textContent = all.filter(r => (r.quality || 0) >= 60).length;
     $("s-upd").textContent = d.updated ? new Date(d.updated).toLocaleString([], {dateStyle: "short", timeStyle: "short"}) : "pending";
     render();
-  }).catch(() => { $("rows").innerHTML = `<tr><td class="empty" colspan="10">Couldn't load finds. Refresh to try again.</td></tr>`; });
+  }).catch(() => { $("rows").innerHTML = `<tr><td class="empty" colspan="11">Couldn't load finds. Refresh to try again.</td></tr>`; });
   {% elif view == "job" %}
   const id = {{ job.id|tojson }};
   head();
