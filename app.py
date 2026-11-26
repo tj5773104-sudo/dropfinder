@@ -58,7 +58,8 @@ def load_feed():
         pass
     if data is None:
         data = df.load_data(LOCAL_DATA)
-    rows = [r for r in data.get("domains", {}).values() if r.get("status") != "TAKEN"]
+    rows = [r for r in data.get("domains", {}).values()
+            if r.get("status") != "TAKEN" and not df.RESTRICTED_RE.search(r.get("domain", ""))]
     rows.sort(key=lambda r: (df.PRIORITY.get(r.get("status"), 9), -r.get("score", 0)))
     for r in rows:  # always use this deployment's affiliate code
         r["buy_url"] = df.buy_url(r["domain"])

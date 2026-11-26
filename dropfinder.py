@@ -69,6 +69,10 @@ IGNORE_TARGETS = {"google.com", "googleapis.com", "gstatic.com", "googleusercont
                   "amazon.com", "facebook.com", "twitter.com", "x.com", "instagram.com", "youtube.com",
                   "linkedin.com", "github.com", "jsdelivr.net", "unpkg.com", "gravatar.com", "wordpress.org",
                   "wp.com", "addtoany.com", "sharethis.com", "feedburner.com", "creativecommons.org"}
+# Zones the public can't register in (government, education, military...).
+RESTRICTED_RE = re.compile(r"\.(gov|edu|mil|ac|nhs|police|sch|k12|gob|gouv|govt|int)(\.[a-z]{2,3})?$|\.(mod|parliament)\.uk$", re.I)
+RESOURCE_RE = re.compile(r"(link|resource|blogroll|partner|directory|friends|useful|recommended|sites|websites|"
+                         r"tools|references|bookmarks|further-reading|webliography|sponsor)", re.I)
 SPAM_RE = re.compile(r"(casino|poker|slot|bet(ting)?|gambl|viagra|cialis|pharma|pills|porn|sex|xxx|escort|adult|"
                      r"payday|loan|replica|cbd|vape|crypto|forex|dating|hookup|weight-?loss|keto)", re.I)
 PARK_RE = re.compile(r"(domain (name )?(is|may be) for sale|buy this domain|this domain (name )?(has expired|is parked|"
@@ -416,6 +420,7 @@ class Crawler:
             ext, internal = extract_links(text, final, headers)
             out.extend(ext)
             if d < depth:
+                internal.sort(key=lambda u: not RESOURCE_RE.search(urlparse(u).path))
                 for u in internal:
                     if u not in seen and urlparse(u).netloc == host and not SKIP_EXT.search(u):
                         seen.add(u)
@@ -445,6 +450,8 @@ class Crawler:
             urls.extend(e for e in entries if e[0] == "url")
         urls = [e for e in urls if registrable(urlparse(e[1]).hostname or "") == site and not SKIP_EXT.search(e[1])]
         urls.sort(key=lambda e: e[2] or "0000")
+        # resource / links pages first (most outbound links), then the oldest pages
+        urls.sort(key=lambda e: not RESOURCE_RE.search(urlparse(e[1]).path))
         picked, seen_u = [], set()
         for _, loc, _ in urls:
             if loc not in seen_u:
@@ -454,7 +461,7 @@ class Crawler:
                 break
         return picked
 
-    def crawl_site(self, root, old_k=8, fallback_pages=6):
+    def crawl_site(self, root, old_k=12, fallback_pages=8):
         """Old pages from the sitemap (best for dead links) plus the homepage; falls back to a shallow crawl."""
         if not root.startswith(("http://", "https://")):
             root = "https://" + root.strip("/") + "/"
@@ -540,10 +547,19 @@ def github_links(query, limit):
     return out
 
 
-def sample_ranked_sites(n, lo=2_000, hi=300_000, rng=random):
-    """n random sites from the Tranco ranking between ranks lo and hi."""
+LINKY_SUFFIX_RE = re.compile(r"\.(edu|ac\.[a-z]{2}|edu\.[a-z]{2}|gov|gov\.[a-z]{2}|org|org\.[a-z]{2}|museum|int)$")
+
+
+def sample_ranked_sites(n, lo=2_000, hi=300_000, rng=random, linky_share=0.5):
+    """n random sites from the Tranco ranking between ranks lo and hi; about half from .edu/.ac/.org/.gov-type
+    sites, which keep old resource pages full of outbound links."""
     pool = [d for d, rk in AUTH.rank.items() if lo <= rk <= hi and d not in IGNORE_TARGETS]
-    return rng.sample(pool, min(n, len(pool)))
+    linky = [d for d in pool if LINKY_SUFFIX_RE.search(d)]
+    k = min(int(n * linky_share), len(linky))
+    picked = set(rng.sample(linky, k))
+    rest = [d for d in pool if d not in picked]
+    picked.update(rng.sample(rest, min(n - k, len(rest))))
+    return list(picked)
 
 
 # --------------------------------------------------------------------------- availability
@@ -780,7 +796,7 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
 
     def one_ranked(d):
         try:
-            recs = crawler.crawl_site(d, old_k=8)
+            recs = crawler.crawl_site(d, old_k=12)
         except Exception:  # noqa: BLE001 - one bad site must not kill the run
             recs = []
         with lock:
@@ -822,7 +838,8 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
             recs = []
         log(f"  {len(recs)} external links")
         records.extend(recs)
-    return [r for r in records if r["target_domain"] not in IGNORE_TARGETS]
+    return [r for r in records if r["target_domain"] not in IGNORE_TARGETS
+            and not RESTRICTED_RE.search(r["target_domain"])]
 
 
 def status_check(domains, resolver_ip=None, rdap_all=False, expiring_days=45, rdap_interval=0.3, workers=40,
@@ -1003,7 +1020,7 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
         f"to {len({r['target_domain'] for r in records})} domains in {int(time.time() - t0)}s.")
 
     data = load_data(data_path)
-    old = data.get("domains", {})
+    old = {d: r for d, r in data.get("domains", {}).items() if not RESTRICTED_RE.search(d)}
     rows = check(records, workers=40, wayback=True, wayback_top=300, verify=True, opr_key=opr_key,
                  site_check_top=1500, max_domains=20000, log=log)
     stamp = now_iso()
@@ -1140,6 +1157,11 @@ def selftest():
     assert "spammy-name" in name_flags("best-casino-bonus.com") and not name_flags("oldlab.org")
     assert "ref=" + SD_REF in buy_url("x.com")
     assert safe_decode(b"ok", "None") == "ok" and safe_decode(b"ok", None) == "ok"
+    assert RESTRICTED_RE.search("recsport.sa.gov.au") and RESTRICTED_RE.search("metrokc.gov") and not RESTRICTED_RE.search("government.com")
+    assert RESOURCE_RE.search("/useful-links/") and not RESOURCE_RE.search("/2009/05/post")
+    AUTH.rank = {f"s{i}.org": 3000 + i for i in range(10)} | {f"c{i}.com": 3000 + i for i in range(10)}
+    sm = sample_ranked_sites(6, rng=random.Random(1))
+    assert len(sm) == 6 and sum(d.endswith(".org") for d in sm) >= 3, sm
     AUTH.rank = {}
     print("selftest: all checks passed")
 
