@@ -912,46 +912,60 @@ def debian_links(sample=2500, rng=random, session=None):
 
 
 def cordis_links(sample=2500, rng=random, session=None, log=lambda m: None):
-    """Project websites of EU-funded FP7 / Horizon 2020 research projects (CORDIS links are dofollow)."""
+    """Project websites of EU-funded FP7 / Horizon 2020 research projects (CORDIS links are dofollow).
+    Current CORDIS dumps keep websites in webLink.csv (one row per link, tied to a projectID)."""
     s = session or requests.Session()
     s.headers["User-Agent"] = UA
     rows = []
+
+    def read_csv(z, name):
+        raw = z.read(name).decode("utf-8-sig", "replace")
+        delim = ";" if raw[:2000].count(";") > raw[:2000].count(",") else ","
+        return csv.DictReader(io.StringIO(raw), delimiter=delim)
+
     for prog in ("fp7", "h2020"):
         try:
             r = s.get(f"https://cordis.europa.eu/data/cordis-{prog}projects-csv.zip", timeout=300)
             z = zipfile.ZipFile(io.BytesIO(r.content))
         except (requests.RequestException, zipfile.BadZipFile) as e:
-            log(f"  CORDIS {prog}: download failed ({type(e).__name__}: {e}); "
-                f"HTTP {getattr(locals().get('r'), 'status_code', '?')}, {len(getattr(locals().get('r'), 'content', b''))} bytes")
+            log(f"  CORDIS {prog}: download failed ({type(e).__name__}: {e})")
             continue
-        log(f"  CORDIS {prog}: {len(r.content):,} bytes, files: {', '.join(z.namelist()[:8])}")
-        for name in z.namelist():
-            if not name.lower().endswith(".csv") or "project" not in name.lower():
-                continue
-            raw = z.read(name).decode("utf-8-sig", "replace")
-            delim = ";" if raw[:2000].count(";") > raw[:2000].count(",") else ","
-            reader = csv.DictReader(io.StringIO(raw), delimiter=delim)
-            log(f"  CORDIS {prog}/{name}: columns {', '.join((reader.fieldnames or [])[:25])}")
-            before = len(rows)
+        names = z.namelist()
+        acronyms = {}
+        proj = next((n for n in names if n.lower().endswith("project.csv")), None)
+        if proj:
+            for row in read_csv(z, proj):
+                low = {k.lower().strip(): (v or "").strip() for k, v in row.items() if k}
+                if low.get("id"):
+                    acronyms[low["id"]] = low.get("acronym", "")
+                url = low.get("projecturl") or low.get("projectwebsite") or ""
+                if url and low.get("id"):  # older dumps kept the website here
+                    rows.append((low["id"], url, low.get("acronym", "")))
+        web = next((n for n in names if "weblink" in n.lower()), None)
+        if web:
+            reader = read_csv(z, web)
+            cols = [c.lower().strip() for c in (reader.fieldnames or [])]
+            log(f"  CORDIS {prog}/{web}: columns {', '.join(cols[:15])}")
+            types, before = defaultdict(int), len(rows)
             for row in reader:
                 low = {k.lower().strip(): (v or "").strip() for k, v in row.items() if k}
-                url = (low.get("projecturl") or low.get("projectwebsite") or low.get("website") or low.get("url")
-                       or low.get("projectwebsiteurl") or "")
-                if "cordis.europa.eu" in url:
-                    url = ""
-                pid = low.get("id") or low.get("projectid") or ""
-                if url and pid:
-                    if not url.startswith(("http://", "https://")):
-                        url = "http://" + url
-                    rows.append((pid, url, low.get("acronym", "")))
-            log(f"  CORDIS {prog}/{name}: {len(rows) - before} projects with a website")
+                pid = low.get("projectid") or low.get("project_id") or low.get("projectrcn") or ""
+                url = low.get("physurl") or low.get("url") or low.get("link") or ""
+                typ = (low.get("type") or low.get("weblinktype") or low.get("represents") or "").lower()
+                types[typ] += 1
+                if low.get("organisationid") or low.get("organizationid"):
+                    continue  # a participant's own website, not the project's
+                if pid and url and ("cordis" not in url and "europa.eu" not in url):
+                    rows.append((pid, url, acronyms.get(pid, "")))
+            log(f"  CORDIS {prog}: {len(rows) - before} project websites; link types {dict(list(types.items())[:6])}")
+    rows = [(p, u if u.startswith(("http://", "https://")) else "http://" + u, a) for p, u, a in rows]
     rows = list(dict.fromkeys(rows))
     rng.shuffle(rows)
     out = []
     for pid, url, acr in rows[:sample]:
-        r = _rec(f"https://cordis.europa.eu/project/id/{pid}", "europa.eu", url, acr, "cordis")
-        if r:
-            out.append(r)
+        rec = _rec(f"https://cordis.europa.eu/project/id/{pid}", "europa.eu", url, acr, "cordis")
+        if rec:
+            out.append(rec)
     return out
 
 
