@@ -377,6 +377,13 @@ form.custom textarea{min-height:120px;font:14px ui-monospace,monospace;padding:1
 .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--teal);border-radius:50%;animation:s 1s linear infinite;vertical-align:-2px;margin-right:6px}
 @keyframes s{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.spin{animation:none}}
 footer{color:var(--mute);font-size:12px;padding:20px 0 32px}
+dialog#buy{width:min(980px,96vw);max-height:92vh;border:1px solid var(--line);border-radius:16px;padding:16px;background:var(--bg);color:var(--ink)}
+dialog#buy::backdrop{background:rgb(0 0 0 / .45)}
+.buyhead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.buyhead h2{margin:2px 0 0;font-size:22px;overflow-wrap:anywhere}.buyhead .lbl{margin:0;color:var(--mute);font-size:12px;font-weight:600}
+.buyhint{margin:8px 0;color:var(--teal);font-size:14px}
+.buyrow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+#buyFrame iframe{display:block;width:100%;min-height:420px;border:0;background:transparent;color-scheme:normal}
 @media(max-width:600px){.intro p{display:none}#sort{flex:1 1 100%}}
 </style></head><body><div class="wrap">
 <header><a class="logo" href="{{ url_for('index') }}">dropfinder</a>
@@ -463,6 +470,16 @@ footer{color:var(--mute);font-size:12px;padding:20px 0 32px}
 <p id="actions" hidden><a class="btn ghost" href="{{ url_for('job_csv', jid=job.id) }}">Download CSV</a></p>
 <div id="rows"></div>
 {% endif %}
+<dialog id="buy" aria-labelledby="buyTitle">
+  <div class="buyhead">
+    <div><p class="lbl">Register with StableDomains</p><h2 id="buyTitle">domain</h2></div>
+    <button type="button" class="ghost" id="buyClose" aria-label="Close">Close</button>
+  </div>
+  <p class="buyhint" id="buyHint">Domain copied - paste it into the search below.</p>
+  <div class="buyrow"><button type="button" id="buyCopy">Copy domain</button>
+    <a class="btn ghost" id="buyOut" href="#" target="_blank" rel="noopener">Open on stabledomains.net ↗</a></div>
+  <div id="buyFrame"></div>
+</dialog>
 <footer>Status from public DNS, RDAP, the Wayback Machine and StableDomains; it can change quickly, so confirm at checkout.
 Tap a source to open the linking page with the backlink highlighted. Register links go to StableDomains (affiliate).</footer>
 </div>
@@ -518,7 +535,7 @@ Tap a source to open the linking page with the backlink highlighted. Register li
     const why = (r.quality_reasons || []).map(x => `<li>${esc(x)}</li>`).join("");
     const buy = safeUrl(r.buy_url) ? esc(r.buy_url) : "#";
     const price = r.sd_price ? ` $${esc(r.sd_price)}` : "";
-    const main = BUY.has(r.status) ? `<a class="btn" href="${buy}" target="_blank" rel="noopener">Register${price}</a>`
+    const main = BUY.has(r.status) ? `<a class="btn reg" data-domain="${esc(r.domain)}" href="${buy}" target="_blank" rel="noopener">Register${price}</a>`
       : `<a class="btn ghost" href="${buy}" target="_blank" rel="noopener">${r.status === "PENDING_DELETE" || r.status === "REDEMPTION" ? "Watch / backorder" : "Check"}</a>`;
     return `<article class="card">
       <div class="top"><div><p class="dom">${esc(r.domain)}</p>
@@ -529,6 +546,42 @@ Tap a source to open the linking page with the backlink highlighted. Register li
       ${srcHtml ? `<div class="src">${srcHtml}</div>` : ""}
       <div class="acts">${main}<a class="btn ghost" href="https://majestic.com/reports/site-explorer?q=${encodeURIComponent(r.domain)}" target="_blank" rel="noopener nofollow">Backlinks</a></div>
     </article>`;
+  }
+
+  // Register opens the StableDomains widget (affiliate) in a pop-up; the widget has no prefill, so copy the domain.
+  const WIDGET = "https://stabledomains.net/embed/domains/RvcumQY-UxdjY6Uagk4v0Lzb?utm_campaign=dropfinder";
+  let widgetLoaded = false;
+  async function copyDomain(d) {
+    try { await navigator.clipboard.writeText(d); return true; } catch (e) { return false; }
+  }
+  function openBuy(domain, href) {
+    const dlg = $("buy");
+    if (!dlg || typeof dlg.showModal !== "function") return false;
+    $("buyTitle").textContent = domain;
+    $("buyOut").href = href;
+    if (!widgetLoaded) {
+      $("buyFrame").innerHTML = `<iframe id="sd-domain-widget" src="${WIDGET}" title="Domain search" allowtransparency="true" allow="clipboard-write" referrerpolicy="origin"></iframe>`;
+      const s = document.createElement("script");
+      s.src = "https://stabledomains.net/widget-host.js"; s.async = true; s.dataset.frame = "sd-domain-widget";
+      document.body.appendChild(s);
+      widgetLoaded = true;
+    }
+    copyDomain(domain).then(ok => { $("buyHint").textContent = ok ? "Domain copied - paste it into the search below." : `Type ${domain} into the search below.`; });
+    dlg.showModal();
+    return true;
+  }
+  if ($("buy")) {
+    document.addEventListener("click", e => {
+      const a = e.target.closest("a.reg");
+      if (!a) return;
+      if (openBuy(a.dataset.domain, a.href)) e.preventDefault();
+    });
+    $("buyClose").addEventListener("click", () => $("buy").close());
+    $("buy").addEventListener("click", e => { if (e.target === $("buy")) $("buy").close(); });
+    $("buyCopy").addEventListener("click", () => copyDomain($("buyTitle").textContent).then(ok => {
+      $("buyCopy").textContent = ok ? "Copied ✓" : "Copy failed - select the name above";
+      setTimeout(() => { $("buyCopy").textContent = "Copy domain"; }, 1800);
+    }));
   }
 
   {% if view == "feed" %}

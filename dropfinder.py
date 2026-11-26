@@ -865,6 +865,30 @@ def estimate_value(r):
     return int(round(core * tl * ln * m / 5) * 5)
 
 
+def stabledomains_value(domain, session):
+    """Free StableDomains heuristic value estimate (GET /api/v1/tools/value?domain=)."""
+    try:
+        j = session.get("https://stabledomains.net/api/v1/tools/value", params={"domain": domain}, timeout=20).json()
+    except (requests.RequestException, ValueError):
+        return None
+
+    def find(o):
+        if isinstance(o, dict):
+            for k in ("estimate_usd", "value_usd", "estimated_value_usd", "estimate", "value", "usd"):
+                v = o.get(k)
+                if isinstance(v, (int, float)) and v >= 0:
+                    return v
+                if isinstance(v, str) and re.fullmatch(r"\$?[\d,]+(\.\d+)?", v.strip()):
+                    return float(v.strip("$").replace(",", ""))
+            for v in o.values():
+                got = find(v)
+                if got is not None:
+                    return got
+        return None
+    v = find(j)
+    return int(v) if v is not None else None
+
+
 def reg_price(r):
     try:
         return float(r.get("sd_price") or 0) or TLD_PRICE.get(r["domain"].partition(".")[2], 25.0)
@@ -1783,6 +1807,21 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
             for r, h in zip(todo, ex.map(wb_safe, todo)):
                 if h:
                     r.update({k: v for k, v in h.items() if v not in (None, "") or k in ("real_years",)})
+    # anchor value estimates to StableDomains' own (free) estimate for the most promising candidates
+    top = sorted((r for r in old.values() if r.get("status") in ("AVAILABLE", "LIKELY_AVAILABLE", "PENDING_DELETE",
+                  "REDEMPTION", "EXPIRED_GRACE") and not r.get("value_usd")),
+                 key=lambda r: -estimate_value(r))[:120]
+    if top and time.time() < t0 + budget_minutes * 60 * 0.97:
+        log(f"Asking StableDomains for value estimates on the top {len(top)} candidates...")
+        sess = requests.Session()
+        sess.headers["User-Agent"] = UA
+        got = 0
+        for r in top:
+            v = stabledomains_value(r["domain"], sess)
+            if v is not None:
+                r["value_usd"], got = v, got + 1
+            time.sleep(0.4)
+        log(f"  {got} estimates received")
     for r in old.values():
         r["est_value"] = estimate_value(r)
         r["reg_price"] = reg_price(r)
