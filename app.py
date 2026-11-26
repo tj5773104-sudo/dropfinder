@@ -59,7 +59,8 @@ def load_feed():
     if data is None:
         data = df.load_data(LOCAL_DATA)
     rows = [r for r in data.get("domains", {}).values()
-            if r.get("status") != "TAKEN" and not df.RESTRICTED_RE.search(r.get("domain", ""))]
+            if r.get("status") != "TAKEN" and not df.RESTRICTED_RE.search(r.get("domain", ""))
+            and df.registrable(r.get("domain", "")) == r.get("domain")]  # never list subdomains
     rows.sort(key=lambda r: (-(r.get("quality") or 0), df.PRIORITY.get(r.get("status"), 9), -r.get("score", 0)))
     for r in rows:  # always use this deployment's affiliate code
         r["buy_url"] = df.buy_url(r["domain"])

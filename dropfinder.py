@@ -702,17 +702,23 @@ def majestic_million(session=None, log=lambda m: None):
     except requests.RequestException as e:
         log(f"  Majestic Million download failed: {e}")
         return []
-    out = []
+    out, seen, skipped = [], set(), 0
     for row in csv.DictReader(io.StringIO(text)):
         try:
-            out.append((int(row["GlobalRank"]), row["Domain"].strip().lower(), int(row.get("RefSubNets") or 0)))
+            d = row["Domain"].strip().lower()
+            rk, sub = int(row["GlobalRank"]), int(row.get("RefSubNets") or 0)
         except (KeyError, ValueError):
             continue
-    log(f"  Majestic Million: {len(out):,} domains")
+        if registrable(d) != d or d in seen:  # subdomains (edition.cnn.com) have no registry record of their own
+            skipped += 1
+            continue
+        seen.add(d)
+        out.append((rk, d, sub))
+    log(f"  Majestic Million: {len(out):,} registrable domains ({skipped:,} subdomain rows skipped)")
     return out
 
 
-def dns_sweep(domains, workers=150, log=lambda m: None):
+def dns_sweep(domains, workers=60, log=lambda m: None):
     """Fast parallel NS lookup; returns the domains that do NOT resolve (nxdomain / no NS / errors)."""
     resolvers = [make_resolver(ns) for ns in ("1.1.1.1", "8.8.8.8", "9.9.9.9")]
     done, lock = [0], threading.Lock()
@@ -720,8 +726,11 @@ def dns_sweep(domains, workers=150, log=lambda m: None):
     def one(i_d):
         i, d = i_d
         st = dns_status(d, resolvers[i % 3])
-        if st == "dns_error":  # retry once on another resolver before trusting it
-            st = dns_status(d, resolvers[(i + 1) % 3])
+        for k in (1, 2):  # retry on the other resolvers before trusting an error
+            if st != "dns_error":
+                break
+            time.sleep(0.5)
+            st = dns_status(d, resolvers[(i + k) % 3])
         with lock:
             done[0] += 1
             if done[0] % 10000 == 0:
@@ -858,6 +867,8 @@ def estimate_value(r):
         m *= 0.1
     if r.get("parked_only"):
         m *= 0.3
+    if r.get("never_archived") or (r.get("real_years") is not None and r.get("real_years") != "" and float(r["real_years"]) == 0):
+        m *= 0.15  # links without a real site behind them are usually spam networks
     if re.search(r"\d", sld):
         m *= 0.7
     if "-" in sld:
@@ -1343,7 +1354,7 @@ def label(rec, expiring_days):
     if reg == "no_rdap" and rec.get("dns") == "nxdomain":
         return "LIKELY_AVAILABLE"
     # An expiry date only matters when the site is gone too: live sites (brands etc.) auto-renew.
-    site_gone = rec.get("site") in ("dead", "parked") or rec.get("dns") in ("nxdomain", "no_ns_answer", "dns_error")
+    site_gone = rec.get("site") in ("dead", "parked") or rec.get("dns") in ("nxdomain", "no_ns_answer")
     if reg in ("registered", "unknown") and rec.get("expiry") and site_gone:
         try:
             exp = datetime.fromisoformat(rec["expiry"].replace("Z", "+00:00"))
@@ -1652,12 +1663,26 @@ def _merge(old, r, stamp):
 
 def graph_scan(pairs, info, log, label):
     """pairs: domains in authority order. DNS sweep -> registry check -> candidate rows."""
-    pairs = [d for d in pairs if d and not RESTRICTED_RE.search(d) and d not in IGNORE_TARGETS]
+    pairs = [d for d in pairs if d and registrable(d) == d and not RESTRICTED_RE.search(d) and d not in IGNORE_TARGETS]
     log(f"{label}: DNS sweep of {len(pairs):,} high-authority domains...")
     dead = dns_sweep(pairs, log=log)
     log(f"  {len(dead):,} do not resolve; asking the registries...")
     recs = status_check(list(dead), rdap_all=True, workers=40, log=log) if dead else {}
     cands = {d: r for d, r in recs.items() if r["status"] != "REGISTERED"}
+    avail = [d for d, r in cands.items() if r["status"] in ("AVAILABLE", "LIKELY_AVAILABLE")][:400]
+    if avail:
+        sess = requests.Session()
+        sess.headers["User-Agent"] = UA
+        dropped = 0
+        for d in avail:
+            info = stabledomains_check(d, sess)
+            if info.get("sd_available") == "no":
+                cands.pop(d, None)
+                dropped += 1
+            elif info.get("sd_available") == "yes":
+                cands[d].update(status="AVAILABLE", sd_available="yes", sd_price=info.get("sd_price", ""))
+            time.sleep(0.3)
+        log(f"  StableDomains confirmed {len(avail) - dropped} of {len(avail)} 'available' ({dropped} were taken)")
     log(f"  {len(cands)} are available / dropping / expired")
     return cands
 
@@ -1683,7 +1708,7 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     rng = random.Random(seed)
     data = load_data(data_path)
     cursors = data.get("cursors", {"majestic": 0, "cc": 0})
-    old = {d: r for d, r in data.get("domains", {}).items() if not RESTRICTED_RE.search(d)}
+    old = {d: r for d, r in data.get("domains", {}).items() if not RESTRICTED_RE.search(d) and registrable(d) == d}
     stamp = now_iso()
     by_source = defaultdict(int)
 
@@ -1948,6 +1973,8 @@ def selftest():
     assert ps[1] == ("url", "https://a.com/old?x=1&y=2", "2009-05-01"), ps
     assert "spammy-name" in name_flags("best-casino-bonus.com") and not name_flags("oldlab.org")
     assert "ref=" + SD_REF in buy_url("x.com")
+    assert registrable("edition.cnn.com") != "edition.cnn.com" and registrable("pavegen.com") == "pavegen.com"
+    assert label({"registration": "registered", "dns": "dns_error", "expiry": "2020-01-01T00:00:00Z"}, 45) == "REGISTERED"
     assert safe_decode(b"ok", "None") == "ok" and safe_decode(b"ok", None) == "ok"
     assert RESTRICTED_RE.search("recsport.sa.gov.au") and RESTRICTED_RE.search("metrokc.gov") and not RESTRICTED_RE.search("government.com")
     assert RESOURCE_RE.search("/useful-links/") and not RESOURCE_RE.search("/2009/05/post")
