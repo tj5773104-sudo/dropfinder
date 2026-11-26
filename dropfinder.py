@@ -573,6 +573,65 @@ def github_links(query, limit):
     return out
 
 
+# ---- Common Crawl web-graph authority (free, no key) ------------------------------------------
+CC_INDEX = "https://index.commoncrawl.org/graphinfo.json"
+CC_BASE = "https://data.commoncrawl.org/projects/hyperlinkgraph"
+
+
+def cc_authority(pos, total):
+    """0-10 score from a harmonic-centrality position among `total` domains (log scale, like PageRank)."""
+    import math
+    if not pos or pos < 1:
+        return None
+    return round(max(0.0, 10 * (1 - math.log10(pos) / math.log10(max(total, 10)))), 1)
+
+
+def cc_web_ranks(domains, session=None, log=lambda m: None, max_seconds=1200, url=None):
+    """Stream Common Crawl's latest domain-level ranks file (several GB, gzip) once and return
+    {domain: {"cc_rank": harmonic-centrality position, "cc_pr_rank": pagerank position, "cc_authority": 0-10}}.
+    Dead domains keep a rank while other sites still link to them - that is the point."""
+    import zlib
+    want = {".".join(reversed(d.split("."))).encode(): d for d in domains}
+    if not want:
+        return {}
+    s = session or requests.Session()
+    s.headers["User-Agent"] = UA
+    if url is None:
+        try:
+            rel = s.get(CC_INDEX, timeout=30).json()[0]["id"]
+        except (requests.RequestException, ValueError, KeyError, IndexError) as e:
+            log(f"  Common Crawl index unavailable: {e}")
+            return {}
+        url = f"{CC_BASE}/{rel}/domain/{rel}-domain-ranks.txt.gz"
+        log(f"  streaming {rel} domain ranks...")
+    found, total, buf, t_end = {}, 0, b"", time.time() + max_seconds
+    dec = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        r = s.get(url, stream=True, timeout=(15, 120))
+        for chunk in r.iter_content(1 << 20):
+            data = buf + dec.decompress(chunk)
+            lines = data.split(b"\n")
+            buf = lines.pop()
+            for ln in lines:
+                parts = ln.split(b"\t", 5)
+                if len(parts) < 5 or not parts[0][:1].isdigit():
+                    continue
+                total += 1
+                key = parts[4].strip()
+                if key in want:
+                    found[want[key]] = (int(parts[0]), int(parts[2]))
+            if time.time() > t_end:
+                log("  time limit reached while streaming ranks; using what was read")
+                break
+        r.close()
+    except (requests.RequestException, zlib.error) as e:
+        log(f"  Common Crawl ranks stream failed: {e}")
+    total = max(total, 1)
+    out = {d: {"cc_rank": hc, "cc_pr_rank": pr, "cc_authority": cc_authority(hc, total)} for d, (hc, pr) in found.items()}
+    log(f"  {total:,} domains scanned, {len(out)} of {len(want)} candidates ranked")
+    return out
+
+
 # ---- verified dofollow niches -------------------------------------------------------------
 # Each of these was checked by hand: the outbound link carries no rel=nofollow/ugc/sponsored.
 CODE_HOSTS = {"sourceforge.net", "gitlab.com", "launchpad.net", "gnu.org", "nongnu.org", "pypi.org", "python.org",
@@ -917,7 +976,7 @@ BUYABLE = {"AVAILABLE", "LIKELY_AVAILABLE"}
 
 # --------------------------------------------------------------------------- library api
 CSV_COLS = ["domain", "status", "score", "dofollow_sources", "nofollow_only_sources", "edu_gov_sources",
-            "best_source_rank", "opr", "ref_domains", "via", "expiry", "dns", "site", "wb_first", "wb_last", "wb_years", "wb_months",
+            "best_source_rank", "cc_authority", "cc_rank", "opr", "ref_domains", "via", "expiry", "dns", "site", "wb_first", "wb_last", "wb_years", "wb_months",
             "sd_available", "sd_price", "flags", "best_source_url", "best_anchor", "link_target_url", "buy_url",
             "more_sources", "first_seen", "last_checked"]
 
@@ -1161,7 +1220,7 @@ def load_data(path):
 
 def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_minutes=40, sites=250,
          wiki_months=4, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=5000,
-         seed=None, hn_months=3, debian_sample=2500, cordis_sample=2500, log=print):
+         seed=None, hn_months=3, debian_sample=2500, cordis_sample=2500, cc_ranks=True, log=print):
     """Fully automatic run: ranked sites' old pages + Wikipedia dead-link months + your seeds.txt,
     then check, verify and merge into the data file."""
     t0 = time.time()
@@ -1192,7 +1251,8 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
             if prev.get("score", 0) > r["score"]:
                 r["score"], r["sources"] = prev["score"], prev.get("sources", r["sources"])
                 r["dofollow_sources"] = max(r["dofollow_sources"], prev.get("dofollow_sources", 0))
-            for k in ("wb_first", "wb_last", "wb_years", "wb_months", "opr", "ref_domains"):
+            for k in ("wb_first", "wb_last", "wb_years", "wb_months", "opr", "ref_domains", "cc_rank", "cc_pr_rank",
+                      "cc_authority"):
                 if k not in r and k in prev:
                     r[k] = prev[k]
         old[r["domain"]] = r
@@ -1211,6 +1271,13 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
             else:
                 r.update(status=rec["status"], expiry=rec.get("expiry", r.get("expiry", "")), dns=rec.get("dns", ""),
                          site=rec.get("site", r.get("site", "")), last_checked=stamp)
+    if cc_ranks:
+        need = [d for d, r in old.items() if r.get("status") != "TAKEN" and "cc_rank" not in r]
+        log(f"Looking up Common Crawl web-graph authority for {len(need)} domains...")
+        for d, info in cc_web_ranks(need, log=log).items():
+            old[d].update(info)
+        for d in need:  # not in the graph at all = no links seen by Common Crawl
+            old[d].setdefault("cc_rank", "")
     cutoff = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
     old = {d: r for d, r in old.items() if not (r.get("status") == "TAKEN" and r.get("taken_at", "") < cutoff)}
     keep = sorted(old.values(), key=lambda r: (r.get("status") == "TAKEN", PRIORITY.get(r.get("status"), 9),
@@ -1273,7 +1340,8 @@ def cmd_check(a):
 def cmd_hunt(a):
     hunt(a.data, a.csv, a.budget_minutes, a.sites, a.wiki_months, a.wiki_limit, a.seeds,
          os.environ.get("OPR_API_KEY"), a.workers, seed=a.random_seed, hn_months=a.hn_months,
-         debian_sample=a.debian, cordis_sample=a.cordis, log=lambda m: print(m, flush=True))
+         debian_sample=a.debian, cordis_sample=a.cordis, cc_ranks=not a.no_cc_ranks,
+         log=lambda m: print(m, flush=True))
 
 
 def selftest():
@@ -1325,6 +1393,7 @@ def selftest():
     AUTH.rank = {f"s{i}.org": 3000 + i for i in range(10)} | {f"c{i}.com": 3000 + i for i in range(10)}
     sm = sample_ranked_sites(6, rng=random.Random(1))
     assert len(sm) == 6 and sum(d.endswith(".org") for d in sm) >= 3, sm
+    assert cc_authority(1, 10**8) == 10.0 and cc_authority(10**4, 10**8) == 5.0 and cc_authority(0, 5) is None
     AUTH.rank = {}
     print("selftest: all checks passed")
 
@@ -1377,6 +1446,7 @@ def main():
     k.add_argument("--hn-months", type=int, default=3, help="random Hacker News months (100+ point stories)")
     k.add_argument("--debian", type=int, default=2500, help="random Debian package homepages")
     k.add_argument("--cordis", type=int, default=2500, help="random EU research project websites")
+    k.add_argument("--no-cc-ranks", action="store_true", help="skip the Common Crawl authority lookup")
     k.add_argument("--workers", type=int, default=24)
     k.add_argument("--random-seed", type=int)
     k.set_defaults(fn=cmd_hunt)

@@ -69,6 +69,8 @@ def load_feed():
                 s["via"] = df.infer_via(s.get("domain") or df.registrable(urlparse(s.get("url", "")).hostname or ""))
         if not r.get("via"):
             r["via"] = ",".join(sorted({s["via"] for s in srcs if s.get("via")}))
+        auth = r.get("opr") if r.get("opr") is not None else r.get("cc_authority")
+        r["authority"] = auth if auth not in ("", None) else None
     feed = {"updated": data.get("updated", ""), "runs": data.get("runs", [])[:10], "rows": rows}
     with LOCK:
         FEED.update(at=time.time(), data=feed)
@@ -429,7 +431,7 @@ Register links go to StableDomains (affiliate).</footer>
   const VIA = {hackernews:"Hacker News", debian:"Debian", cordis:"EU project", crawl:"ranked site", wikipedia:"Wikipedia"};
   const viaTags = v => (v || "").split(",").filter(Boolean).map(x => `<span class="via">${esc(VIA[x] || x)}</span>`).join("");
   const COLS = [["domain","Domain"],["status","Status"],["score","Score"],["dofollow_sources","Dofollow sites"],
-    ["best_source_rank","Top linker rank"],["opr","PageRank"],["ref_domains","Ref. domains"],["wb_years","Age (yrs)"],["expiry","Expiry"],["sources","Linked from"],["buy",""]];
+    ["best_source_rank","Top linker rank"],["authority","Authority"],["cc_rank","Web rank"],["wb_years","Age (yrs)"],["expiry","Expiry"],["sources","Linked from"],["buy",""]];
   function rowHtml(r) {
     const src = r.sources || [];
     const items = src.map(s => `<li>${link(s.url)} <span class="tag">${esc(s.follow)}</span>${s.rank ? ` <span class="tag">#${esc(Number(s.rank).toLocaleString())}</span>` : ""}${s.anchor ? ` "${esc(s.anchor)}"` : ""}</li>`).join("");
@@ -443,7 +445,7 @@ Register links go to StableDomains (affiliate).</footer>
       <td><span class="tag ${esc(r.status)}">${esc(NICE[r.status] || r.status)}</span></td>
       <td class="n">${esc(r.score)}</td><td class="n">${esc(r.dofollow_sources)}</td>
       <td class="n">${r.best_source_rank ? "#" + esc(Number(r.best_source_rank).toLocaleString()) : ""}</td>
-      <td class="n">${r.opr != null ? esc(r.opr) : ""}</td><td class="n">${r.ref_domains ? esc(Number(r.ref_domains).toLocaleString()) : ""}</td>
+      <td class="n">${r.authority != null ? esc(r.authority) : ""}</td><td class="n">${r.cc_rank ? "#" + esc(Number(r.cc_rank).toLocaleString()) : ""}</td>
       <td class="n">${r.wb_years ? esc(r.wb_years) : ""}</td><td>${esc((r.expiry || "").slice(0, 10))}</td>
       <td>${viaTags(r.via)}${link(first)}${src.length > 1 ? `<details><summary>${src.length} linking pages</summary><ul>${items}</ul></details>` : ""}</td>
       <td>${act}</td></tr>`;
@@ -485,7 +487,7 @@ Register links go to StableDomains (affiliate).</footer>
     $(id).addEventListener(ev, () => { shown = 200; render(); })));
   head();
   $("thead").addEventListener("click", e => { const k = e.target.dataset.k; if (!k || k === "sources" || k === "buy") return;
-    sortDir = sortKey === k ? -sortDir : (["domain", "status", "expiry", "best_source_rank"].includes(k) ? 1 : -1); sortKey = k; render(); });
+    sortDir = sortKey === k ? -sortDir : (["domain", "status", "expiry", "best_source_rank", "cc_rank"].includes(k) ? 1 : -1); sortKey = k; render(); });
   $("morebtn").addEventListener("click", () => { shown += 200; render(); });
   fetch("{{ url_for('feed_json') }}").then(r => r.json()).then(d => {
     all = d.rows || [];
