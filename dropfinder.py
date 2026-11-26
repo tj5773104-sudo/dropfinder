@@ -1201,8 +1201,14 @@ def parse_rdap(j):
         state = "pending_delete"
     elif any("redemption" in s for s in statuses):
         state = "redemption"
-    elif any("renew period" in s for s in statuses):
-        state = "grace"
+    elif any("renew period" in s for s in statuses) and expiry:
+        # "auto renew period" also follows a normal renewal, so only trust it when expiry is in the past
+        try:
+            exp = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+            if (exp.tzinfo and exp < datetime.now(timezone.utc)) or (not exp.tzinfo and exp < datetime.now()):
+                state = "grace"
+        except ValueError:
+            pass
     return {"registration": state, "expiry": expiry or "", "statuses": ";".join(statuses)}
 
 
@@ -1349,7 +1355,7 @@ def label(rec, expiring_days):
         return "PENDING_DELETE"
     if reg == "redemption":
         return "REDEMPTION"
-    if reg == "grace":
+    if reg == "grace" and not (rec.get("expiry") and rec["expiry"][:10] > datetime.now(timezone.utc).date().isoformat()):
         return "EXPIRED_GRACE"
     if reg == "no_rdap" and rec.get("dns") == "nxdomain":
         return "LIKELY_AVAILABLE"
@@ -1951,7 +1957,8 @@ def selftest():
     p = parse_rdap({"status": ["client hold", "pending delete"],
                     "events": [{"eventAction": "expiration", "eventDate": "2026-12-01T00:00:00Z"}]})
     assert p["registration"] == "pending_delete" and p["expiry"].startswith("2026-12-01")
-    assert parse_rdap({"status": ["auto renew period"]})["registration"] == "grace"
+    assert parse_rdap({"status": ["auto renew period"], "events": [{"eventAction": "expiration", "eventDate": "2020-01-01T00:00:00Z"}]})["registration"] == "grace"
+    assert parse_rdap({"status": ["auto renew period"], "events": [{"eventAction": "expiration", "eventDate": "2099-01-01T00:00:00Z"}]})["registration"] == "registered"
     assert label({"registration": "available", "dns": "nxdomain"}, 45) == "AVAILABLE"
     assert label({"registration": "no_rdap", "dns": "nxdomain"}, 45) == "LIKELY_AVAILABLE"
     soon = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()

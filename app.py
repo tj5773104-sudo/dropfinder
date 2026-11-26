@@ -406,7 +406,7 @@ dialog#buy::backdrop{background:rgb(0 0 0 / .45)}
   <div class="row1">
     <div class="chips" id="chips"></div>
     <select id="sort" aria-label="Sort by">
-      <option value="value">Best value for money</option><option value="quality">Best quality</option><option value="drops">Dropping soonest</option>
+      <option value="quality">Best quality</option><option value="value">Best value for money</option><option value="drops">Dropping soonest</option>
       <option value="ref_subnets">Most referring networks</option><option value="authority">Highest authority</option>
       <option value="real_years">Longest real history</option><option value="price">Cheapest</option><option value="domain">A-Z</option></select>
     <div class="viewtog" role="group" aria-label="Layout"><button type="button" id="vGrid" aria-pressed="true">Grid</button><button type="button" id="vList" aria-pressed="false">List</button></div>
@@ -594,7 +594,7 @@ Tap a source to open the linking page with the backlink highlighted. Register li
   $("chips").innerHTML = Object.keys(GROUPS).map(g => `<button type="button" class="chip" aria-pressed="${DEFAULT_ON.includes(g)}" data-g="${g}">${g}</button>`).join("");
   DEFAULT_ON.forEach(g => GROUPS[g].forEach(s => status.add(s)));
   const SORTS = {
-    value: (a, b) => (b.value_ratio || 0) - (a.value_ratio || 0) || (b.quality || 0) - (a.quality || 0),
+    value: (a, b) => (b.value_ratio || 0) * (0.3 + (b.quality || 0) / 100) - (a.value_ratio || 0) * (0.3 + (a.quality || 0) / 100),
     quality: (a, b) => (b.quality || 0) - (a.quality || 0),
     drops: (a, b) => (a.expiry || "9999").localeCompare(b.expiry || "9999"),
     ref_subnets: (a, b) => (num(b.ref_subnets) || 0) - (num(a.ref_subnets) || 0),
