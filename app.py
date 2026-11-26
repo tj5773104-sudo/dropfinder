@@ -321,7 +321,22 @@ td a{color:var(--teal);overflow-wrap:anywhere}
 .count{margin:0 0 8px;font-size:14px;color:var(--mute)}.count b{color:var(--ink)}
 .q{display:inline-block;min-width:38px;text-align:center;font-weight:800;border-radius:6px;padding:2px 6px}
 .qhi{background:#0d768026;color:var(--teal)}
-.anchor{font-style:italic}.muted{color:var(--mute)}a.bl{font-size:12px;white-space:nowrap}.qmid{background:var(--line)}.qlo{color:var(--mute)}
+.anchor{font-style:italic}.muted{color:var(--mute)}a.bl{font-size:12px;white-space:nowrap}
+@media(max-width:820px){
+  .scroll{overflow:visible;border:0;background:none}
+  .scroll table,.scroll tbody{display:block}.scroll thead{display:none}
+  #rows tr{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;background:var(--card);border:1px solid var(--line);
+    border-radius:12px;padding:14px;margin-bottom:12px}
+  #rows td{display:block;border:0;padding:0;text-align:left;min-width:0}
+  #rows td:empty{display:none}
+  #rows td[data-l]:not([data-l=""])::before{content:attr(data-l);display:block;font-size:11px;font-weight:600;
+    color:var(--mute);text-transform:none;margin-bottom:1px}
+  #rows td.dom,#rows td[data-l="Linked from"],#rows td[data-l="Anchor text"],#rows td.act{grid-column:1/-1}
+  #rows td.dom b{font-size:18px}
+  #rows td.act .btn{width:100%;justify-content:center;min-height:44px;font-size:15px}
+  #rows td.empty{grid-column:1/-1}
+  .bar{gap:8px}.bar input[type=text]{flex:1 1 140px}.bar select{flex:1 1 160px}
+}.qmid{background:var(--line)}.qlo{color:var(--mute)}
 details summary{cursor:pointer;color:var(--mute);font-size:13px}
 details ul{margin:6px 0 0;padding-left:18px;font-size:13px}
 pre.log{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;max-height:220px;overflow:auto;font-size:13px;white-space:pre-wrap}
@@ -443,8 +458,9 @@ Register links go to StableDomains (affiliate).</footer>
     ["authority","Authority"],["real_years","Real site (yrs)"],["dofollow_sources","Dofollow sites"],["expiry","Drops / expiry"],["sources","Source"],["anchor","Anchor text"],["buy",""]];
   function rowHtml(r) {
     const src = r.sources || [];
-    const items = src.map(s => `<li>${link(s.url)} <span class="tag">${esc(s.follow)}</span>${s.rank ? ` <span class="tag">#${esc(Number(s.rank).toLocaleString())}</span>` : ""}${s.anchor ? ` "${esc(s.anchor)}"` : ""}</li>`).join("");
-    const first = src[0] ? src[0].url : r.best_source_url;
+    const items = src.map(s => `<li>${jumpLink(s)} <span class="tag">${esc(s.follow)}</span>${s.rank ? ` <span class="tag">#${esc(Number(s.rank).toLocaleString())}</span>` : ""}${s.anchor ? ` "${esc(s.anchor)}"` : ""}</li>`).join("");
+    const first = src[0] || {url: r.best_source_url, anchor: r.best_anchor};
+    const host = (() => { try { return new URL(first.url).hostname.replace(/^www\./, ""); } catch (e) { return first.url || ""; } })();
     const flags = r.flags ? `<div class="flag">${esc(r.flags)}</div>` : "";
     const price = r.sd_price ? ` $${esc(r.sd_price)}` : "";
     const buy = safeUrl(r.buy_url) ? esc(r.buy_url) : "#";
@@ -452,26 +468,39 @@ Register links go to StableDomains (affiliate).</footer>
       : `<a class="btn small ghost" href="${buy}" target="_blank" rel="noopener">Check</a>`;
     const why = (r.quality_reasons || []).map(x => `<li>${esc(x)}</li>`).join("");
     const realY = r.real_years != null && r.real_years !== "" ? r.real_years : "";
-    return `<tr><td><b>${esc(r.domain)}</b>${flags}${why ? `<details><summary>why</summary><ul>${why}</ul></details>` : ""}</td>
-      <td><span class="tag ${esc(r.status)}">${esc(NICE[r.status] || r.status)}</span></td>
-      <td class="n"><span class="q ${qClass(r.quality || 0)}">${r.quality != null ? esc(r.quality) : ""}</span></td>
-      <td class="n">${r.ref_subnets ? esc(Number(r.ref_subnets).toLocaleString()) : ""}</td>
-      <td class="n">${r.authority != null ? esc(r.authority) : ""}</td>
-      <td class="n">${esc(realY)}</td>
-      <td class="n">${r.dofollow_sources ? esc(r.dofollow_sources) : ""}</td>
-      <td>${esc((r.expiry || "").slice(0, 10))}</td>
-      <td>${viaTags(r.via)}${link(first)}${src.length > 1 ? `<details><summary>${src.length} linking pages</summary><ul>${items}</ul></details>` : ""}</td>
-      <td>${anchorCell(r)}</td>
-      <td>${act}</td></tr>`;
+    return `<tr><td class="dom" data-l=""><b>${esc(r.domain)}</b>${flags}${why ? `<details><summary>why</summary><ul>${why}</ul></details>` : ""}</td>
+      <td data-l="Status"><span class="tag ${esc(r.status)}">${esc(NICE[r.status] || r.status)}</span></td>
+      <td class="n" data-l="Quality"><span class="q ${qClass(r.quality || 0)}">${r.quality != null ? esc(r.quality) : ""}</span></td>
+      <td class="n" data-l="Ref. networks">${r.ref_subnets ? esc(Number(r.ref_subnets).toLocaleString()) : ""}</td>
+      <td class="n" data-l="Authority">${r.authority != null ? esc(r.authority) : ""}</td>
+      <td class="n" data-l="Real site (yrs)">${esc(realY)}</td>
+      <td class="n" data-l="Dofollow sites">${r.dofollow_sources ? esc(r.dofollow_sources) : ""}</td>
+      <td data-l="Drops / expiry">${esc((r.expiry || "").slice(0, 10))}</td>
+      <td data-l="Linked from">${viaTags(r.via)}${first.url ? jumpLink(first, host + " ↗") : ""}${src.length > 1 ? `<details><summary>${src.length} linking pages</summary><ul>${items}</ul></details>` : ""}</td>
+      <td data-l="Anchor text">${anchorCell(r)}</td>
+      <td class="act" data-l="">${act}</td></tr>`;
   }
+  // Opens the linking page scrolled to the backlink, highlighted (URL text fragment: #:~:text=...).
+  const frag = t => encodeURIComponent(t).replace(/-/g, "%2D").replace(/,/g, "%2C");
+  function jumpUrl(s) {
+    if (!safeUrl(s.url)) return "";
+    const base = s.url.split("#")[0];
+    let t = (s.anchor || "").replace(/\s+/g, " ").trim();
+    if (t.length > 70) t = t.slice(0, 70).replace(/\s+\S*$/, "");
+    return t.length >= 3 && t !== "Wayback history" && s.via !== "wikipedia" ? `${base}#:~:text=${frag(t)}` : base;
+  }
+  const jumpLink = (s, label) => {
+    const u = jumpUrl(s);
+    return u ? `<a href="${esc(u)}" target="_blank" rel="noopener nofollow">${esc(label ?? s.url)}</a>` : esc(label ?? s.url);
+  };
   function anchorCell(r) {
     const src = (r.sources || []).filter(s => s.anchor && s.anchor !== "Wayback history");
     const best = src.find(s => s.follow === "dofollow") || src[0];
     const bl = `<a class="bl" href="https://majestic.com/reports/site-explorer?q=${encodeURIComponent(r.domain)}" target="_blank" rel="noopener nofollow">Backlinks ↗</a>`;
     if (!best) return `<span class="muted">-</span><div>${bl}</div>`;
     const more = src.length > 1 ? `<details><summary>${src.length} anchors</summary><ul>${src.map(s =>
-      `<li>"${esc(s.anchor)}" <span class="tag">${esc(s.follow || "?")}</span></li>`).join("")}</ul></details>` : "";
-    return `<span class="anchor">"${esc(best.anchor)}"</span> <span class="tag ${best.follow === "dofollow" ? "AVAILABLE" : ""}">${esc(best.follow || "?")}</span>`
+      `<li>${jumpLink(s, '"' + s.anchor + '"')} <span class="tag">${esc(s.follow || "?")}</span></li>`).join("")}</ul></details>` : "";
+    return `<span class="anchor">${jumpLink(best, '"' + best.anchor + '"')}</span> <span class="tag ${best.follow === "dofollow" ? "AVAILABLE" : ""}">${esc(best.follow || "?")}</span>`
       + (best.rank ? ` <span class="tag">#${esc(Number(best.rank).toLocaleString())}</span>` : "") + more + `<div>${bl}</div>`;
   }
   function head() { $("thead").innerHTML = COLS.map(([k, t]) => `<th data-k="${k}">${t}</th>`).join(""); }
@@ -519,6 +548,15 @@ Register links go to StableDomains (affiliate).</footer>
     $("s-drop").textContent = all.filter(r => ["PENDING_DELETE", "REDEMPTION", "EXPIRED_GRACE", "EXPIRING_SOON"].includes(r.status)).length;
     $("s-total").textContent = all.length;
     $("s-q60").textContent = all.filter(r => (r.quality || 0) >= 60).length;
+    const vc = {};
+    all.forEach(r => (r.via || "").split(",").filter(Boolean).forEach(v => vc[v] = (vc[v] || 0) + 1));
+    [...$("via").options].forEach(o => {
+      if (!o.dataset.name) o.dataset.name = o.textContent;
+      if (!o.value) { o.textContent = `All sources (${all.length})`; return; }
+      const n = vc[o.value] || 0;
+      o.textContent = n ? `${o.dataset.name} (${n})` : `${o.dataset.name} (0 - next hunt)`;
+      o.disabled = !n;
+    });
     $("s-upd").textContent = d.updated ? new Date(d.updated).toLocaleString([], {dateStyle: "short", timeStyle: "short"}) : "pending";
     render();
   }).catch(() => { $("rows").innerHTML = `<tr><td class="empty" colspan="11">Couldn't load finds. Refresh to try again.</td></tr>`; });
