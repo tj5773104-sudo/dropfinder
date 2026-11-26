@@ -336,12 +336,14 @@ select,input[type=text],input[type=number]{font:16px "Libre Franklin",system-ui,
 /* list view: one find per full-width row */
 #rows.list{grid-template-columns:1fr;grid-auto-rows:auto}
 @media(min-width:700px){
-  #rows.list .card{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1.6fr) minmax(0,1.6fr) auto;
+  #rows.list .card{display:grid;grid-template-columns:minmax(230px,1.3fr) minmax(0,1.5fr) minmax(0,1.6fr) auto;
     grid-template-areas:"top meta src acts" "top why src acts";align-items:start;gap:6px 18px}
   #rows.list .top{grid-area:top}#rows.list .meta{grid-area:meta}#rows.list .why{grid-area:why}
   #rows.list .src{grid-area:src;border-top:0;padding-top:0}
   #rows.list .acts{grid-area:acts;margin:0;grid-template-columns:1fr;align-self:center;min-width:170px}
   #rows.list .top .q{margin-left:12px}
+  #rows.list .dom{overflow-wrap:normal;word-break:normal}
+  #rows.list .acts{min-width:150px}
 }
 .top{display:flex;gap:10px;align-items:flex-start}
 .dom{font-weight:800;font-size:17px;line-height:1.25;overflow-wrap:anywhere;margin:0}
