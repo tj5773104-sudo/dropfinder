@@ -717,30 +717,40 @@ def debian_links(sample=2500, rng=random, session=None):
     return out
 
 
-def cordis_links(sample=2500, rng=random, session=None):
+def cordis_links(sample=2500, rng=random, session=None, log=lambda m: None):
     """Project websites of EU-funded FP7 / Horizon 2020 research projects (CORDIS links are dofollow)."""
     s = session or requests.Session()
     s.headers["User-Agent"] = UA
     rows = []
     for prog in ("fp7", "h2020"):
         try:
-            r = s.get(f"https://cordis.europa.eu/data/cordis-{prog}projects-csv.zip", timeout=180)
+            r = s.get(f"https://cordis.europa.eu/data/cordis-{prog}projects-csv.zip", timeout=300)
             z = zipfile.ZipFile(io.BytesIO(r.content))
-        except (requests.RequestException, zipfile.BadZipFile):
+        except (requests.RequestException, zipfile.BadZipFile) as e:
+            log(f"  CORDIS {prog}: download failed ({type(e).__name__}: {e}); "
+                f"HTTP {getattr(locals().get('r'), 'status_code', '?')}, {len(getattr(locals().get('r'), 'content', b''))} bytes")
             continue
+        log(f"  CORDIS {prog}: {len(r.content):,} bytes, files: {', '.join(z.namelist()[:8])}")
         for name in z.namelist():
             if not name.lower().endswith(".csv") or "project" not in name.lower():
                 continue
             raw = z.read(name).decode("utf-8-sig", "replace")
             delim = ";" if raw[:2000].count(";") > raw[:2000].count(",") else ","
-            for row in csv.DictReader(io.StringIO(raw), delimiter=delim):
+            reader = csv.DictReader(io.StringIO(raw), delimiter=delim)
+            log(f"  CORDIS {prog}/{name}: columns {', '.join((reader.fieldnames or [])[:25])}")
+            before = len(rows)
+            for row in reader:
                 low = {k.lower().strip(): (v or "").strip() for k, v in row.items() if k}
-                url = low.get("projecturl") or low.get("url") or ""
+                url = (low.get("projecturl") or low.get("projectwebsite") or low.get("website") or low.get("url")
+                       or low.get("projectwebsiteurl") or "")
+                if "cordis.europa.eu" in url:
+                    url = ""
                 pid = low.get("id") or low.get("projectid") or ""
                 if url and pid:
                     if not url.startswith(("http://", "https://")):
                         url = "http://" + url
                     rows.append((pid, url, low.get("acronym", "")))
+            log(f"  CORDIS {prog}/{name}: {len(rows) - before} projects with a website")
     rows = list(dict.fromkeys(rows))
     rng.shuffle(rows)
     out = []
@@ -1039,7 +1049,7 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
         if arg and not crawler.expired():
             log(f"Reading {label_}...")
             try:
-                recs = fn(arg, rng=rng)
+                recs = fn(arg, rng=rng, log=log) if fn is cordis_links else fn(arg, rng=rng)
             except Exception as e:  # noqa: BLE001
                 log(f"  failed: {type(e).__name__}: {e}")
                 recs = []
@@ -1262,12 +1272,15 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     stale = [d for d, r in old.items() if d not in fresh and r.get("status") != "TAKEN"]
     if stale:
         log(f"Re-checking {len(stale)} domains from earlier runs...")
-        recs = status_check(stale, site_check=[d for d in stale if old[d].get("status") in ("PARKED", "DEAD_SITE")],
-                            log=log)
+        # always ask the registry: a live-looking domain may still be expiring, in grace or in redemption
+        recs = status_check(stale, rdap_all=True,
+                            site_check=[d for d in stale if old[d].get("status") in ("PARKED", "DEAD_SITE")], log=log)
         for d, rec in recs.items():
             r = old[d]
-            if rec["status"] == "REGISTERED":
+            if rec["status"] == "REGISTERED" and rec.get("registration") == "registered":
                 r["status"], r["taken_at"] = "TAKEN", stamp
+            elif rec["status"] == "REGISTERED":
+                r["last_checked"] = stamp  # registry unreachable / unknown: keep the old status
             else:
                 r.update(status=rec["status"], expiry=rec.get("expiry", r.get("expiry", "")), dns=rec.get("dns", ""),
                          site=rec.get("site", r.get("site", "")), last_checked=stamp)
