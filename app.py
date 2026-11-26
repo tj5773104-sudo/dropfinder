@@ -284,7 +284,9 @@ h1 span{color:var(--teal)}
 .stat b{display:block;font-size:28px;font-weight:800;line-height:1.1}.stat span{font-size:13px;color:var(--mute)}
 .bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:12px}
 .bar input[type=text],.bar input[type=number]{font:16px inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);min-height:42px}
-.bar input[type=number]{width:80px}.bar label{display:flex;gap:6px;align-items:center;font-size:14px}
+.bar select{font:16px inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);min-height:42px}
+.bar input[type=number]{width:80px}
+.via{display:inline-block;font-size:11px;font-weight:600;padding:1px 7px;border-radius:99px;border:1px solid var(--teal);color:var(--teal);margin:0 4px 4px 0;white-space:nowrap}.bar label{display:flex;gap:6px;align-items:center;font-size:14px}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .chip{border:1px solid var(--line);background:var(--bg);color:var(--ink);border-radius:99px;padding:6px 12px;font:600 13px inherit;cursor:pointer;min-height:36px}
 .chip[aria-pressed=true]{background:var(--teal);border-color:var(--teal);color:#fff}
@@ -328,8 +330,9 @@ footer{color:var(--mute);font-size:13px;padding:24px 0 40px}
 {% if view == "feed" %}
 <div class="hero">
   <div><h1>Expired domains that still have <span>authority backlinks</span></h1>
-  <p class="lede">Found automatically. Every few hours dropfinder reads the oldest pages of top-ranked websites and
-  Wikipedia's dead-link lists, checks every domain they link to, and lists the ones that are free, dropping or expired,
+  <p class="lede">Found automatically. Every few hours dropfinder reads dofollow link sources that die often - Hacker News
+  front-page stories, Debian package homepages, EU research project sites and the oldest pages of top-ranked websites -
+  plus Wikipedia's dead-link lists, checks every domain they link to, and lists the ones that are free, dropping or expired,
   ranked by the authority of the sites linking to them.</p></div>
   <form class="huntbox" method="post" action="{{ url_for('hunt_auto') }}">
     <button type="submit">Hunt now</button>
@@ -346,6 +349,9 @@ footer{color:var(--mute);font-size:13px;padding:24px 0 40px}
   <div class="chips" id="chips"></div>
   <input type="text" id="q" placeholder="Search domain" aria-label="Search domain">
   <input type="text" id="tld" placeholder="TLDs e.g. com,org" aria-label="TLDs">
+  <select id="via" aria-label="Link source"><option value="">All sources</option><option value="hackernews">Hacker News</option>
+    <option value="debian">Debian packages</option><option value="cordis">EU research projects</option>
+    <option value="crawl">Ranked sites</option><option value="wikipedia">Wikipedia</option></select>
   <label>Min score <input type="number" id="minscore" min="0" step="0.5" value="0"></label>
   <label><input type="checkbox" id="dfonly"> Dofollow only</label>
   <label><input type="checkbox" id="nospam" checked> Hide spammy</label>
@@ -412,6 +418,8 @@ Register links go to StableDomains (affiliate).</footer>
     EXPIRED_GRACE:"expired (grace)",EXPIRING_SOON:"expiring soon",PARKED:"parked",DEAD_SITE:"dead site",REGISTERED:"registered"};
   const ORDER = {AVAILABLE:0,PENDING_DELETE:1,REDEMPTION:2,EXPIRED_GRACE:3,LIKELY_AVAILABLE:4,EXPIRING_SOON:5,PARKED:6,DEAD_SITE:7};
   const BUY = new Set(["AVAILABLE","LIKELY_AVAILABLE"]);
+  const VIA = {hackernews:"Hacker News", debian:"Debian", cordis:"EU project", crawl:"ranked site", wikipedia:"Wikipedia"};
+  const viaTags = v => (v || "").split(",").filter(Boolean).map(x => `<span class="via">${esc(VIA[x] || x)}</span>`).join("");
   const COLS = [["domain","Domain"],["status","Status"],["score","Score"],["dofollow_sources","Dofollow sites"],
     ["best_source_rank","Top linker rank"],["opr","PageRank"],["ref_domains","Ref. domains"],["wb_years","Age (yrs)"],["expiry","Expiry"],["sources","Linked from"],["buy",""]];
   function rowHtml(r) {
@@ -429,7 +437,7 @@ Register links go to StableDomains (affiliate).</footer>
       <td class="n">${r.best_source_rank ? "#" + esc(Number(r.best_source_rank).toLocaleString()) : ""}</td>
       <td class="n">${r.opr != null ? esc(r.opr) : ""}</td><td class="n">${r.ref_domains ? esc(Number(r.ref_domains).toLocaleString()) : ""}</td>
       <td class="n">${r.wb_years ? esc(r.wb_years) : ""}</td><td>${esc((r.expiry || "").slice(0, 10))}</td>
-      <td>${link(first)}${src.length > 1 ? `<details><summary>${src.length} linking pages</summary><ul>${items}</ul></details>` : ""}</td>
+      <td>${viaTags(r.via)}${link(first)}${src.length > 1 ? `<details><summary>${src.length} linking pages</summary><ul>${items}</ul></details>` : ""}</td>
       <td>${act}</td></tr>`;
   }
   function head() { $("thead").innerHTML = COLS.map(([k, t]) => `<th data-k="${k}">${t}</th>`).join(""); }
@@ -449,7 +457,8 @@ Register links go to StableDomains (affiliate).</footer>
     let rows = all.filter(r => (!status.size || status.has(r.status)) && (!q || r.domain.includes(q))
       && (!tl.length || tl.includes(r.domain.split(".").slice(1).join(".")) || tl.includes(r.domain.split(".").pop()))
       && (r.score || 0) >= ms && (!$("dfonly").checked || r.dofollow_sources > 0)
-      && (!$("nospam").checked || !(r.flags || "").includes("spammy")));
+      && (!$("nospam").checked || !(r.flags || "").includes("spammy"))
+      && (!$("via").value || (r.via || "").split(",").includes($("via").value)));
     if (sortKey) rows = rows.slice().sort((a, b) => {
       let x = a[sortKey] ?? "", y = b[sortKey] ?? "";
       if (sortKey === "status") { x = ORDER[x] ?? 9; y = ORDER[y] ?? 9; }
@@ -463,7 +472,7 @@ Register links go to StableDomains (affiliate).</footer>
   $("chips").addEventListener("click", e => { const b = e.target.closest(".chip"); if (!b) return;
     const on = b.getAttribute("aria-pressed") !== "true"; b.setAttribute("aria-pressed", String(on));
     GROUPS[b.dataset.g].forEach(s => on ? status.add(s) : status.delete(s)); shown = 200; render(); });
-  ["q", "tld", "minscore", "dfonly", "nospam"].forEach(id => $(id).addEventListener("input", () => { shown = 200; render(); }));
+  ["q", "tld", "minscore", "dfonly", "nospam", "via"].forEach(id => $(id).addEventListener("input", () => { shown = 200; render(); }));
   head();
   $("thead").addEventListener("click", e => { const k = e.target.dataset.k; if (!k || k === "sources" || k === "buy") return;
     sortDir = sortKey === k ? -sortDir : (["domain", "status", "expiry", "best_source_rank"].includes(k) ? 1 : -1); sortKey = k; render(); });

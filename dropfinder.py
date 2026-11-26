@@ -176,7 +176,7 @@ def extract_links(html, page_url, headers=None):
         else:
             follow, reason = "dofollow", "no nofollow signal found"
         external.append(dict(source_url=page_url, source_domain=src_dom, target_url=url,
-                             target_domain=tgt, anchor=l["text"], follow=follow, reason=reason))
+                             target_domain=tgt, anchor=l["text"], follow=follow, reason=reason, via="crawl"))
     return external, internal
 
 
@@ -514,7 +514,8 @@ def wikipedia_links(category, limit):
                         continue
                     if dom and dom != "wikipedia.org":
                         out.append(dict(source_url=src, source_domain="wikipedia.org", target_url=url,
-                                        target_domain=dom, anchor="", follow="nofollow", reason="platform policy"))
+                                        target_domain=dom, anchor="", follow="nofollow", reason="platform policy",
+                                        via="wikipedia"))
             if "continue" not in r:
                 break
             cont = r["continue"]
@@ -544,6 +545,116 @@ def github_links(query, limit):
                    headers={"Accept": "application/vnd.github.html+json"}, timeout=30)
         if rr.status_code == 200:
             out.extend(extract_links(rr.text, f"https://github.com/{full}")[0])
+    return out
+
+
+# ---- verified dofollow niches -------------------------------------------------------------
+# Each of these was checked by hand: the outbound link carries no rel=nofollow/ugc/sponsored.
+CODE_HOSTS = {"sourceforge.net", "gitlab.com", "launchpad.net", "gnu.org", "nongnu.org", "pypi.org", "python.org",
+              "cpan.org", "metacpan.org", "rubygems.org", "npmjs.com", "haskell.org", "bitbucket.org", "debian.org",
+              "freedesktop.org", "kde.org", "gnome.org", "perl.org", "codeberg.org", "packagist.org", "crates.io",
+              "golang.org", "go.dev", "readthedocs.io", "readthedocs.org", "github.io", "googlecode.com",
+              "mozilla.org", "apache.org", "r-project.org", "ctan.org", "ubuntu.com", "fedoraproject.org",
+              "europa.eu", "ec.europa.eu", "medium.com", "blogspot.com", "wordpress.com", "tumblr.com",
+              "techcrunch.com", "nytimes.com", "bbc.co.uk", "theguardian.com", "arxiv.org", "nature.com"}
+
+
+def _rec(source_url, source_domain, target_url, anchor, via, follow="dofollow", reason="verified source"):
+    try:
+        dom = registrable(urlparse(target_url).hostname or "")
+    except ValueError:
+        return None
+    if not dom or dom == source_domain or dom in CODE_HOSTS or dom in IGNORE_TARGETS or RESTRICTED_RE.search(dom):
+        return None
+    return dict(source_url=source_url, source_domain=source_domain, target_url=target_url, target_domain=dom,
+                anchor=(anchor or "")[:100], follow=follow, reason=reason, via=via)
+
+
+def hn_links(months=3, min_points=100, rng=random, session=None):
+    """Hacker News stories with >= min_points from random months 2008-2018 (title links are dofollow)."""
+    s = session or requests.Session()
+    s.headers["User-Agent"] = UA
+    out = []
+    for _ in range(months):
+        y, m = rng.randint(2008, 2018), rng.randint(1, 12)
+        start = int(datetime(y, m, 1, tzinfo=timezone.utc).timestamp())
+        end = int(datetime(y + (m == 12), m % 12 + 1, 1, tzinfo=timezone.utc).timestamp())
+        for page in range(3):
+            try:
+                j = s.get("https://hn.algolia.com/api/v1/search_by_date", timeout=30, params={
+                    "tags": "story", "hitsPerPage": 1000, "page": page,
+                    "numericFilters": f"points>={min_points},created_at_i>={start},created_at_i<{end}"}).json()
+            except (requests.RequestException, ValueError):
+                break
+            for h in j.get("hits", []):
+                if h.get("url"):
+                    r = _rec(f"https://news.ycombinator.com/item?id={h.get('objectID')}", "ycombinator.com",
+                             h["url"], h.get("title"), "hackernews")
+                    if r:
+                        out.append(r)
+            if page + 1 >= j.get("nbPages", 0):
+                break
+    return out
+
+
+def debian_links(sample=2500, rng=random, session=None):
+    """Upstream homepages of Debian source packages (packages.debian.org 'Homepage' links are dofollow)."""
+    import lzma
+    s = session or requests.Session()
+    s.headers["User-Agent"] = UA
+    pkgs = {}
+    for suite in ("stable", "unstable"):
+        try:
+            r = s.get(f"https://deb.debian.org/debian/dists/{suite}/main/source/Sources.xz", timeout=120)
+            text = lzma.decompress(r.content).decode("utf-8", "replace")
+        except (requests.RequestException, lzma.LZMAError):
+            continue
+        for block in text.split("\n\n"):
+            pk = re.search(r"^Package: (.+)$", block, re.M)
+            hp = re.search(r"^Homepage: (\S+)", block, re.M)
+            if pk and hp:
+                pkgs.setdefault(pk.group(1).strip(), (hp.group(1).strip(), suite))
+    items = list(pkgs.items())
+    rng.shuffle(items)
+    out = []
+    for name, (hp, suite) in items[:sample]:
+        r = _rec(f"https://packages.debian.org/source/{suite}/{name}", "debian.org", hp, "Homepage", "debian")
+        if r:
+            out.append(r)
+    return out
+
+
+def cordis_links(sample=2500, rng=random, session=None):
+    """Project websites of EU-funded FP7 / Horizon 2020 research projects (CORDIS links are dofollow)."""
+    s = session or requests.Session()
+    s.headers["User-Agent"] = UA
+    rows = []
+    for prog in ("fp7", "h2020"):
+        try:
+            r = s.get(f"https://cordis.europa.eu/data/cordis-{prog}projects-csv.zip", timeout=180)
+            z = zipfile.ZipFile(io.BytesIO(r.content))
+        except (requests.RequestException, zipfile.BadZipFile):
+            continue
+        for name in z.namelist():
+            if not name.lower().endswith(".csv") or "project" not in name.lower():
+                continue
+            raw = z.read(name).decode("utf-8-sig", "replace")
+            delim = ";" if raw[:2000].count(";") > raw[:2000].count(",") else ","
+            for row in csv.DictReader(io.StringIO(raw), delimiter=delim):
+                low = {k.lower().strip(): (v or "").strip() for k, v in row.items() if k}
+                url = low.get("projecturl") or low.get("url") or ""
+                pid = low.get("id") or low.get("projectid") or ""
+                if url and pid:
+                    if not url.startswith(("http://", "https://")):
+                        url = "http://" + url
+                    rows.append((pid, url, low.get("acronym", "")))
+    rows = list(dict.fromkeys(rows))
+    rng.shuffle(rows)
+    out = []
+    for pid, url, acr in rows[:sample]:
+        r = _rec(f"https://cordis.europa.eu/project/id/{pid}", "europa.eu", url, acr, "cordis")
+        if r:
+            out.append(r)
     return out
 
 
@@ -772,14 +883,14 @@ BUYABLE = {"AVAILABLE", "LIKELY_AVAILABLE"}
 
 # --------------------------------------------------------------------------- library api
 CSV_COLS = ["domain", "status", "score", "dofollow_sources", "nofollow_only_sources", "edu_gov_sources",
-            "best_source_rank", "opr", "ref_domains", "expiry", "dns", "site", "wb_first", "wb_last", "wb_years", "wb_months",
+            "best_source_rank", "opr", "ref_domains", "via", "expiry", "dns", "site", "wb_first", "wb_last", "wb_years", "wb_months",
             "sd_available", "sd_price", "flags", "best_source_url", "best_anchor", "link_target_url", "buy_url",
             "more_sources", "first_seen", "last_checked"]
 
 
 def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categories=(), wiki_limit=300,
             github_query=None, github_limit=30, public_only=False, sitemaps=False, ranked_sites=(),
-            deadline=None, log=lambda msg: None):
+            deadline=None, hn_months=0, debian_sample=0, cordis_sample=0, rng=random, log=lambda msg: None):
     """Collect outbound link records from seeds, ranked sites' old pages, Wikipedia and GitHub."""
     crawler = Crawler(delay=delay, public_only=public_only, deadline=deadline)
     records = []
@@ -829,6 +940,18 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
             recs = []
         log(f"  {len(recs)} external links")
         records.extend(recs)
+    for label_, fn, arg in (("Hacker News front-page stories", hn_links, hn_months),
+                            ("Debian package homepages", debian_links, debian_sample),
+                            ("EU research project websites", cordis_links, cordis_sample)):
+        if arg and not crawler.expired():
+            log(f"Reading {label_}...")
+            try:
+                recs = fn(arg, rng=rng)
+            except Exception as e:  # noqa: BLE001
+                log(f"  failed: {type(e).__name__}: {e}")
+                recs = []
+            log(f"  {len(recs)} dofollow links")
+            records.extend(recs)
     if github_query:
         log(f"Searching GitHub for '{github_query}'...")
         try:
@@ -932,6 +1055,7 @@ def build_row(rec, rs, score):
             continue
         seen.add(r["source_url"])
         sources.append({"url": r["source_url"], "domain": r["source_domain"], "follow": r["follow"],
+                        "via": r.get("via", ""),
                         "rank": AUTH.get(r["source_domain"]), "anchor": r["anchor"], "target": r["target_url"]})
         if len(sources) >= 6:
             break
@@ -941,6 +1065,7 @@ def build_row(rec, rs, score):
             "best_source_rank": min(ranks) if ranks else "",
             "expiry": rec.get("expiry", ""), "dns": rec.get("dns", ""), "site": rec.get("site", ""),
             "flags": ",".join(name_flags(rec["domain"])),
+            "via": ",".join(sorted({r.get("via", "") for r in rs if r.get("via")})),
             "best_source_url": best["source_url"], "best_anchor": best["anchor"], "link_target_url": best["target_url"],
             "buy_url": buy_url(rec["domain"]),
             "more_sources": " | ".join(s["url"] for s in sources[:5]), "sources": sources}
@@ -1002,7 +1127,7 @@ def load_data(path):
 
 def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_minutes=40, sites=250,
          wiki_months=4, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=5000,
-         seed=None, log=print):
+         seed=None, hn_months=3, debian_sample=2500, cordis_sample=2500, log=print):
     """Fully automatic run: ranked sites' old pages + Wikipedia dead-link months + your seeds.txt,
     then check, verify and merge into the data file."""
     t0 = time.time()
@@ -1015,7 +1140,8 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     cats = random_dead_link_categories(wiki_months, rng)
     deadline = t0 + budget_minutes * 60 * 0.55
     records = harvest(my_seeds, sitemaps=True, ranked_sites=ranked, wiki_categories=cats, wiki_limit=wiki_limit,
-                      workers=workers, deadline=deadline, log=log)
+                      workers=workers, deadline=deadline, hn_months=hn_months, debian_sample=debian_sample,
+                      cordis_sample=cordis_sample, rng=rng, log=log)
     log(f"Harvested {len(records)} links ({sum(r['follow'] == 'dofollow' for r in records)} dofollow) "
         f"to {len({r['target_domain'] for r in records})} domains in {int(time.time() - t0)}s.")
 
@@ -1059,6 +1185,8 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     for r in keep:
         counts[r["status"]] += 1
     run = {"at": stamp, "seconds": int(time.time() - t0), "ranked_sites": len(ranked), "wiki_categories": cats,
+           "by_source": {v: sum(1 for r in records if r.get("via") == v) for v in
+                         ("crawl", "wikipedia", "hackernews", "debian", "cordis")},
            "links": len(records), "new_candidates": len([r for r in rows if r["first_seen"] == stamp]),
            "counts": dict(counts)}
     data = {"updated": stamp, "tranco_loaded": bool(AUTH.rank), "runs": ([run] + data.get("runs", []))[:30],
@@ -1110,7 +1238,8 @@ def cmd_check(a):
 
 def cmd_hunt(a):
     hunt(a.data, a.csv, a.budget_minutes, a.sites, a.wiki_months, a.wiki_limit, a.seeds,
-         os.environ.get("OPR_API_KEY"), a.workers, seed=a.random_seed, log=lambda m: print(m, flush=True))
+         os.environ.get("OPR_API_KEY"), a.workers, seed=a.random_seed, hn_months=a.hn_months,
+         debian_sample=a.debian, cordis_sample=a.cordis, log=lambda m: print(m, flush=True))
 
 
 def selftest():
@@ -1211,6 +1340,9 @@ def main():
     k.add_argument("--wiki-months", type=int, default=4, help="random Wikipedia dead-link months")
     k.add_argument("--wiki-limit", type=int, default=150, help="articles per Wikipedia month")
     k.add_argument("--seeds", default="seeds.txt", help="your own seed pages (optional)")
+    k.add_argument("--hn-months", type=int, default=3, help="random Hacker News months (100+ point stories)")
+    k.add_argument("--debian", type=int, default=2500, help="random Debian package homepages")
+    k.add_argument("--cordis", type=int, default=2500, help="random EU research project websites")
     k.add_argument("--workers", type=int, default=24)
     k.add_argument("--random-seed", type=int)
     k.set_defaults(fn=cmd_hunt)
