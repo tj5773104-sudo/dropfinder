@@ -191,6 +191,18 @@ def safe_decode(raw, encoding):
     return raw.decode(enc, errors="replace")
 
 
+def read_capped(r, max_bytes, max_seconds=20):
+    """Read a streamed response, stopping at max_bytes or after max_seconds of wall-clock time
+    (defeats servers that drip data slowly to keep a connection open)."""
+    buf, t_end = bytearray(), time.time() + max_seconds
+    while len(buf) < max_bytes and time.time() < t_end:
+        chunk = r.raw.read(min(65536, max_bytes - len(buf)), decode_content=True)
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
+
+
 def fetch(url, session, timeout=15, max_bytes=2_000_000, url_ok=None, kinds=("html",)):
     """GET a URL. Returns (text, headers, final_url) or None. Content-type must contain one of `kinds`
     (None = anything). If url_ok is given, redirects are followed by hand and every hop must pass it."""
@@ -210,7 +222,7 @@ def fetch(url, session, timeout=15, max_bytes=2_000_000, url_ok=None, kinds=("ht
         ctype = r.headers.get("content-type", "").lower()
         if r.status_code >= 400 or (kinds and not any(k in ctype for k in kinds)):
             return None
-        raw = r.raw.read(max_bytes, decode_content=True)
+        raw = read_capped(r, max_bytes)
         if raw[:2] == b"\x1f\x8b":
             try:
                 raw = gzip.decompress(raw)[:max_bytes * 5]
@@ -782,7 +794,7 @@ def site_state(domain, session, public_only=False):
             for _ in range(6):
                 if public_only and not public_url(url):
                     return "live"  # cannot inspect safely; never claim dead
-                r = session.get(url, timeout=8, stream=True, allow_redirects=False)
+                r = session.get(url, timeout=(6, 8), stream=True, allow_redirects=False)
                 if r.is_redirect:
                     nxt = urljoin(url, r.headers.get("location", ""))
                     r.close()
@@ -794,7 +806,7 @@ def site_state(domain, session, public_only=False):
             else:
                 return "live"
             try:
-                body = safe_decode(r.raw.read(300_000, decode_content=True), r.encoding)
+                body = safe_decode(read_capped(r, 300_000, 10), r.encoding)
             except Exception:  # noqa: BLE001
                 body = ""
             finally:
