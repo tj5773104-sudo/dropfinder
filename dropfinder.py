@@ -584,6 +584,15 @@ CODE_HOSTS = {"sourceforge.net", "gitlab.com", "launchpad.net", "gnu.org", "nong
               "techcrunch.com", "nytimes.com", "bbc.co.uk", "theguardian.com", "arxiv.org", "nature.com"}
 
 
+VIA_BY_SOURCE = {"wikipedia.org": "wikipedia", "ycombinator.com": "hackernews", "debian.org": "debian",
+                 "europa.eu": "cordis", "github.com": "github"}
+
+
+def infer_via(source_domain):
+    """Which harvester a link came from, worked out from the linking site (for rows saved before 'via')."""
+    return VIA_BY_SOURCE.get(source_domain or "", "crawl")
+
+
 def _rec(source_url, source_domain, target_url, anchor, via, follow="dofollow", reason="verified source"):
     try:
         dom = registrable(urlparse(target_url).hostname or "")

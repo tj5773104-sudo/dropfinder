@@ -63,6 +63,12 @@ def load_feed():
     rows.sort(key=lambda r: (df.PRIORITY.get(r.get("status"), 9), -r.get("score", 0)))
     for r in rows:  # always use this deployment's affiliate code
         r["buy_url"] = df.buy_url(r["domain"])
+        srcs = r.get("sources") or []
+        for s in srcs:  # rows saved before link sources were tracked: work the source out
+            if not s.get("via"):
+                s["via"] = df.infer_via(s.get("domain") or df.registrable(urlparse(s.get("url", "")).hostname or ""))
+        if not r.get("via"):
+            r["via"] = ",".join(sorted({s["via"] for s in srcs if s.get("via")}))
     feed = {"updated": data.get("updated", ""), "runs": data.get("runs", [])[:10], "rows": rows}
     with LOCK:
         FEED.update(at=time.time(), data=feed)
@@ -308,6 +314,7 @@ td a{color:var(--teal);overflow-wrap:anywhere}
 .AVAILABLE,.LIKELY_AVAILABLE{background:#0d768026;color:var(--teal)}
 .PENDING_DELETE,.REDEMPTION,.EXPIRED_GRACE{background:#990f3d1f;color:var(--claret)}
 .flag{font-size:12px;color:var(--claret)}
+.count{margin:0 0 8px;font-size:14px;color:var(--mute)}.count b{color:var(--ink)}
 details summary{cursor:pointer;color:var(--mute);font-size:13px}
 details ul{margin:6px 0 0;padding-left:18px;font-size:13px}
 pre.log{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;max-height:220px;overflow:auto;font-size:13px;white-space:pre-wrap}
@@ -357,6 +364,7 @@ footer{color:var(--mute);font-size:13px;padding:24px 0 40px}
   <label><input type="checkbox" id="nospam" checked> Hide spammy</label>
   <a class="btn small ghost" href="{{ url_for('feed_csv') }}">CSV</a>
 </div>
+<p class="count" id="count" aria-live="polite"></p>
 <div class="scroll"><table><thead><tr id="thead"></tr></thead><tbody id="rows"><tr><td class="empty" colspan="11"><span class="spin"></span>Loading finds...</td></tr></tbody></table></div>
 <p id="more" hidden><button class="btn ghost" id="morebtn" type="button">Show more</button></p>
 
@@ -468,11 +476,13 @@ Register links go to StableDomains (affiliate).</footer>
     $("rows").innerHTML = rows.length ? rows.slice(0, shown).map(rowHtml).join("")
       : `<tr><td class="empty" colspan="11">${all.length ? "Nothing matches these filters." : "No finds yet - the first automatic hunt runs within a few hours. Press Hunt now to run one."}</td></tr>`;
     $("more").hidden = rows.length <= shown;
+    $("count").innerHTML = `Showing <b>${Math.min(rows.length, shown)}</b> of <b>${rows.length}</b> matching finds (${all.length} tracked)`;
   }
   $("chips").addEventListener("click", e => { const b = e.target.closest(".chip"); if (!b) return;
     const on = b.getAttribute("aria-pressed") !== "true"; b.setAttribute("aria-pressed", String(on));
     GROUPS[b.dataset.g].forEach(s => on ? status.add(s) : status.delete(s)); shown = 200; render(); });
-  ["q", "tld", "minscore", "dfonly", "nospam", "via"].forEach(id => $(id).addEventListener("input", () => { shown = 200; render(); }));
+  ["q", "tld", "minscore", "dfonly", "nospam", "via"].forEach(id => ["input", "change"].forEach(ev =>
+    $(id).addEventListener(ev, () => { shown = 200; render(); })));
   head();
   $("thead").addEventListener("click", e => { const k = e.target.dataset.k; if (!k || k === "sources" || k === "buy") return;
     sortDir = sortKey === k ? -sortDir : (["domain", "status", "expiry", "best_source_rank"].includes(k) ? 1 : -1); sortKey = k; render(); });
