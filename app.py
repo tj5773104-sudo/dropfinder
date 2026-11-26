@@ -325,8 +325,24 @@ select,input[type=text],input[type=number]{font:16px "Libre Franklin",system-ui,
 .more label{display:flex;gap:6px;align-items:center;font-size:14px}
 .more input[type=number]{width:72px}
 .count{margin:0 0 10px;font-size:13px;color:var(--mute)}.count b{color:var(--ink)}
-#rows{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(min(100%,340px),1fr));align-items:start}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:10px}
+#rows{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(min(100%,340px),1fr));grid-auto-rows:1fr;align-items:stretch}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:10px;height:100%}
+.card .acts{margin-top:auto}
+.card .src a.bk{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.card details[open]{position:relative}
+.viewtog{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex:none}
+.viewtog button{background:var(--card);color:var(--ink);border:0;border-radius:0;min-height:38px;padding:6px 12px;font-size:13px}
+.viewtog button[aria-pressed=true]{background:var(--teal);color:#fff}
+/* list view: one find per full-width row */
+#rows.list{grid-template-columns:1fr;grid-auto-rows:auto}
+@media(min-width:700px){
+  #rows.list .card{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1.6fr) minmax(0,1.6fr) auto;
+    grid-template-areas:"top meta src acts" "top why src acts";align-items:start;gap:6px 18px}
+  #rows.list .top{grid-area:top}#rows.list .meta{grid-area:meta}#rows.list .why{grid-area:why}
+  #rows.list .src{grid-area:src;border-top:0;padding-top:0}
+  #rows.list .acts{grid-area:acts;margin:0;grid-template-columns:1fr;align-self:center;min-width:170px}
+  #rows.list .top .q{margin-left:12px}
+}
 .top{display:flex;gap:10px;align-items:flex-start}
 .dom{font-weight:800;font-size:17px;line-height:1.25;overflow-wrap:anywhere;margin:0}
 .q{flex:none;margin-left:auto;text-align:center;border-radius:10px;padding:4px 8px;min-width:52px;line-height:1.1}
@@ -383,6 +399,7 @@ footer{color:var(--mute);font-size:12px;padding:20px 0 32px}
       <option value="value">Best value for money</option><option value="quality">Best quality</option><option value="drops">Dropping soonest</option>
       <option value="ref_subnets">Most referring networks</option><option value="authority">Highest authority</option>
       <option value="real_years">Longest real history</option><option value="price">Cheapest</option><option value="domain">A-Z</option></select>
+    <div class="viewtog" role="group" aria-label="Layout"><button type="button" id="vGrid" aria-pressed="true">Grid</button><button type="button" id="vList" aria-pressed="false">List</button></div>
     <button type="button" class="ghost" id="moreBtn" aria-expanded="false" aria-controls="more">Filters</button>
   </div>
   <div class="more" id="more" hidden>
@@ -488,7 +505,7 @@ Tap a source to open the linking page with the backlink highlighted. Register li
     let srcHtml = "";
     if (best && best.anchor && best.anchor !== "Wayback history") {
       srcHtml = `<span class="lbl">Backlink${vias ? " - " + esc(vias) : ""}</span>
-        <a href="${esc(jumpUrl(best))}" target="_blank" rel="noopener nofollow"><span class="anchor">"${esc(best.anchor)}"</span> on ${esc(hostOf(best.url))} ↗</a>
+        <a class="bk" href="${esc(jumpUrl(best))}" target="_blank" rel="noopener nofollow"><span class="anchor">"${esc(best.anchor)}"</span> on ${esc(hostOf(best.url))} ↗</a>
         <span><span class="tag ${best.follow === "dofollow" ? "df" : ""}">${esc(best.follow || "link")}</span>${best.rank ? ` <span class="tag">site #${esc(Number(best.rank).toLocaleString())}</span>` : ""}</span>`;
     } else if (best) {
       srcHtml = `<span class="lbl">Found via ${esc(vias || "link")}</span><a href="${esc(jumpUrl(best))}" target="_blank" rel="noopener nofollow">${esc(hostOf(best.url))} ↗</a>`;
@@ -506,7 +523,7 @@ Tap a source to open the linking page with the backlink highlighted. Register li
         <span class="tag ${esc(r.status)}">${esc(NICE[r.status] || r.status)}</span>${r.flags ? ` <span class="flag">${esc(r.flags)}</span>` : ""}</div>
         ${q !== null ? `<div class="q ${qClass(q)}"><b>${esc(q)}</b><small>quality</small></div>` : ""}</div>
       ${meta.length ? `<div class="meta">${meta.join("")}</div>` : ""}
-      ${why ? `<details><summary>Why this score</summary><ul>${why}</ul></details>` : ""}
+      ${why ? `<details class="why"><summary>Why this score</summary><ul>${why}</ul></details>` : ""}
       ${srcHtml ? `<div class="src">${srcHtml}</div>` : ""}
       <div class="acts">${main}<a class="btn ghost" href="https://majestic.com/reports/site-explorer?q=${encodeURIComponent(r.domain)}" target="_blank" rel="noopener nofollow">Backlinks</a></div>
     </article>`;
@@ -555,6 +572,17 @@ Tap a source to open the linking page with the backlink highlighted. Register li
   $("moreBtn").addEventListener("click", () => { const open = $("more").hidden; $("more").hidden = !open;
     $("moreBtn").setAttribute("aria-expanded", String(open)); $("moreBtn").textContent = open ? "Hide filters" : "Filters"; });
   $("morebtn").addEventListener("click", () => { shown += 60; render(); });
+  function setView(v) {
+    $("rows").classList.toggle("list", v === "list");
+    $("vGrid").setAttribute("aria-pressed", String(v !== "list"));
+    $("vList").setAttribute("aria-pressed", String(v === "list"));
+    try { localStorage.setItem("df-view", v); } catch (e) {}
+  }
+  $("vGrid").addEventListener("click", () => setView("grid"));
+  $("vList").addEventListener("click", () => setView("list"));
+  let saved = "grid";
+  try { saved = localStorage.getItem("df-view") || "grid"; } catch (e) {}
+  setView(saved);
   fetch("{{ url_for('feed_json') }}").then(r => r.json()).then(d => {
     all = d.rows || [];
     $("s-avail").textContent = all.filter(r => BUY.has(r.status)).length;
