@@ -176,6 +176,17 @@ def extract_links(html, page_url, headers=None):
     return external, internal
 
 
+def safe_decode(raw, encoding):
+    """Decode bytes with the server's charset if it is a real codec, else UTF-8."""
+    import codecs
+    try:
+        codecs.lookup(encoding or "utf-8")
+        enc = encoding or "utf-8"
+    except (LookupError, TypeError):
+        enc = "utf-8"
+    return raw.decode(enc, errors="replace")
+
+
 def fetch(url, session, timeout=15, max_bytes=2_000_000, url_ok=None, kinds=("html",)):
     """GET a URL. Returns (text, headers, final_url) or None. Content-type must contain one of `kinds`
     (None = anything). If url_ok is given, redirects are followed by hand and every hop must pass it."""
@@ -201,7 +212,7 @@ def fetch(url, session, timeout=15, max_bytes=2_000_000, url_ok=None, kinds=("ht
                 raw = gzip.decompress(raw)[:max_bytes * 5]
             except OSError:
                 return None
-        return raw.decode(r.encoding or "utf-8", errors="replace"), r.headers, r.url
+        return safe_decode(raw, r.encoding), r.headers, r.url
     finally:
         r.close()
 
@@ -637,7 +648,7 @@ def site_state(domain, session, public_only=False):
             else:
                 return "live"
             try:
-                body = r.raw.read(300_000, decode_content=True).decode(r.encoding or "utf-8", errors="replace")
+                body = safe_decode(r.raw.read(300_000, decode_content=True), r.encoding)
             except Exception:  # noqa: BLE001
                 body = ""
             finally:
@@ -755,7 +766,10 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
     done, nlinks = [0], [0]
 
     def one_seed(s):
-        recs = crawler.crawl_site(s, old_k=8) if sitemaps else crawler.crawl(s, depth, max_pages)
+        try:
+            recs = crawler.crawl_site(s, old_k=8) if sitemaps else crawler.crawl(s, depth, max_pages)
+        except Exception:  # noqa: BLE001
+            recs = []
         return s, recs
 
     def one_ranked(d):
@@ -825,6 +839,13 @@ def status_check(domains, resolver_ip=None, rdap_all=False, expiring_days=45, rd
         return rdap_lookup(domain, base, session, limiter)
 
     def check_one(domain):
+        try:
+            return _check_one(domain)
+        except Exception as e:  # noqa: BLE001 - one odd domain must not kill the run
+            return {"domain": domain, "dns": "", "registration": "unknown", "status": "REGISTERED",
+                    "note": f"{type(e).__name__}"}
+
+    def _check_one(domain):
         rec = {"domain": domain, "dns": dns_status(domain, resolver)}
         if rec["dns"] in ("nxdomain", "dns_error", "no_ns_answer") or rdap_all:
             rec.update(rdap(domain))
@@ -910,7 +931,12 @@ def enrich(rows, wayback=False, wayback_top=100, verify=False, opr_key=None, log
         top = rows[:wayback_top]
         log(f"Pulling Wayback history for {len(top)} domains...")
         with ThreadPoolExecutor(4) as ex:
-            for row, wb in zip(top, ex.map(lambda r: wayback_summary(r["domain"], session), top)):
+            def wb(r):
+                try:
+                    return wayback_summary(r["domain"], session)
+                except Exception:  # noqa: BLE001
+                    return {}
+            for row, wb in zip(top, ex.map(wb, top)):
                 row.update(wb)
     if verify:
         avail = [r for r in rows if r["status"] in BUYABLE][:150]
@@ -1105,6 +1131,7 @@ def selftest():
     assert ps[1] == ("url", "https://a.com/old?x=1&y=2", "2009-05-01"), ps
     assert "spammy-name" in name_flags("best-casino-bonus.com") and not name_flags("oldlab.org")
     assert "ref=" + SD_REF in buy_url("x.com")
+    assert safe_decode(b"ok", "None") == "ok" and safe_decode(b"ok", None) == "ok"
     AUTH.rank = {}
     print("selftest: all checks passed")
 
