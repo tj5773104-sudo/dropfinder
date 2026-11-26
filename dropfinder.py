@@ -1,62 +1,107 @@
 #!/usr/bin/env python3
 """
-dropfinder - find expired / available domains that are linked from pages you choose,
+dropfinder - find expired / dropping domains that still have links from high-authority pages,
 and tell you whether each link is dofollow.
 
 Pipeline
-  1. harvest : collect outbound links from seed pages (blogs, resource pages, .edu
-               pages, awesome-lists), Wikipedia categories and GitHub READMEs.
-               Each link is classified dofollow / nofollow from the rendered HTML.
-  2. check   : for every linked-to domain, check DNS and RDAP to see whether it is
-               unregistered, in redemption, pending delete, or about to expire.
-               Optionally pulls Wayback Machine history.
-  3. output  : a CSV ranked by availability and by a simple link-quality score.
+  1. harvest : collect outbound links from
+                 - seed pages you choose (resource pages, blogrolls, .edu link lists)
+                 - the OLDEST pages of ranked sites, found through their sitemaps (old pages = most dead links)
+                 - Wikipedia "dead external links" categories
+                 - GitHub READMEs
+               Each link is classified dofollow / nofollow from the HTML, and each linking
+               site gets an authority weight from its Tranco top-1M rank.
+  2. check   : for every linked-to domain: DNS, then RDAP for unregistered / redemption /
+               pending delete / expired-in-grace. Live-looking domains with strong links are
+               also visited to spot dead or parked sites. Optional Wayback history,
+               Open PageRank, StableDomains availability + price.
+  3. hunt    : fully automatic: samples ranked sites + Wikipedia months, checks everything and
+               merges results into data/candidates.json (run on a schedule by GitHub Actions).
 
 Quick start
-  pip install requests tldextract dnspython
-  python dropfinder.py harvest --seeds seeds.txt --depth 1 --out links.jsonl
-  python dropfinder.py check --links links.jsonl --out candidates.csv --wayback
+  pip install -r requirements.txt
+  python dropfinder.py selftest
+  python dropfinder.py hunt --budget-minutes 20 --sites 100
+  python dropfinder.py harvest --seeds seeds.txt --sitemaps --out links.jsonl
+  python dropfinder.py check --links links.jsonl --out candidates.csv --wayback --verify
 
-  python dropfinder.py selftest      # offline tests, no network needed
-
-"dofollow" here means: no rel=nofollow/ugc/sponsored on the link, no robots
-nofollow on the page, and the source is not a platform known to nofollow
-everything. It is read from static HTML, so links injected by JavaScript are
-not seen. Treat it as a strong filter, not a guarantee.
+"dofollow" = no rel=nofollow/ugc/sponsored on the link, no robots nofollow on the page, and the
+source is not a platform that nofollows everything. Read from static HTML: a strong filter, not a guarantee.
 """
 import argparse
 import csv
+import gzip
+import html as htmllib
+import io
 import json
 import os
+import random
 import re
 import sys
 import threading
 import time
 import urllib.robotparser
+import zipfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 import tldextract
 
-UA = "dropfinder/0.1 (personal research crawler; polite, obeys robots.txt)"
+UA = "dropfinder/0.2 (+https://github.com/tj5773104-sudo/dropfinder; polite research crawler, obeys robots.txt)"
 _TLD = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
+SD_REF = os.environ.get("SD_REF", "wfmff7tz")
 
-# Platforms that nofollow user-placed links. Links from these are useful for
-# discovering candidates (and for referral traffic) but carry little direct SEO value.
-NOFOLLOW_PLATFORMS = {"wikipedia.org", "wikimedia.org", "youtube.com", "reddit.com", "github.com"}
-EDU_GOV_SUFFIXES = (".edu", ".gov", ".ac.uk", ".gov.uk", ".edu.au", ".gov.au", ".ac.nz", ".ac.jp", ".ac.in", ".edu.cn")
-SKIP_EXT = re.compile(r"\.(pdf|jpe?g|png|gif|svg|zip|gz|mp4|mp3|css|js|xml|docx?|xlsx?|pptx?)(\?|$)", re.I)
+NOFOLLOW_PLATFORMS = {"wikipedia.org", "wikimedia.org", "youtube.com", "reddit.com", "github.com", "medium.com",
+                      "quora.com", "twitter.com", "x.com", "facebook.com", "linkedin.com", "pinterest.com"}
+EDU_GOV_SUFFIXES = (".edu", ".gov", ".ac.uk", ".gov.uk", ".edu.au", ".gov.au", ".ac.nz", ".ac.jp", ".ac.in", ".edu.cn",
+                    ".mil", ".int", ".nhs.uk", ".gc.ca", ".europa.eu")
+SKIP_EXT = re.compile(r"\.(pdf|jpe?g|png|gif|svg|webp|zip|gz|mp4|mp3|css|js|xml|json|docx?|xlsx?|pptx?)(\?|$)", re.I)
 NOFOLLOW_RELS = {"nofollow", "ugc", "sponsored"}
+# Domains that never make sense as targets (infrastructure, shorteners, giants).
+IGNORE_TARGETS = {"google.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "doubleclick.net",
+                  "cloudflare.com", "cloudfront.net", "amazonaws.com", "akamaihd.net", "akamaized.net", "fbcdn.net",
+                  "bit.ly", "t.co", "goo.gl", "tinyurl.com", "ow.ly", "doi.org", "archive.org", "wikipedia.org",
+                  "wikimedia.org", "wikidata.org", "w3.org", "schema.org", "apple.com", "microsoft.com",
+                  "amazon.com", "facebook.com", "twitter.com", "x.com", "instagram.com", "youtube.com",
+                  "linkedin.com", "github.com", "jsdelivr.net", "unpkg.com", "gravatar.com", "wordpress.org",
+                  "wp.com", "addtoany.com", "sharethis.com", "feedburner.com", "creativecommons.org"}
+SPAM_RE = re.compile(r"(casino|poker|slot|bet(ting)?|gambl|viagra|cialis|pharma|pills|porn|sex|xxx|escort|adult|"
+                     r"payday|loan|replica|cbd|vape|crypto|forex|dating|hookup|weight-?loss|keto)", re.I)
+PARK_RE = re.compile(r"(domain (name )?(is|may be) for sale|buy this domain|this domain (name )?(has expired|is parked|"
+                     r"may be for sale)|domain has expired|parked (free|domain|by)|sedoparking|parkingcrew|bodis|"
+                     r"afternic|dan\.com|hugedomains|domainmarket|undeveloped|godaddy\.com/forsale|"
+                     r"expired domain|renew (it )?now|account suspended|suspendedpage)", re.I)
 
 
 # --------------------------------------------------------------------------- helpers
 def registrable(host):
     e = _TLD(host or "")
     return f"{e.domain}.{e.suffix}".lower() if e.domain and e.suffix else ""
+
+
+def now_iso():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def buy_url(domain):
+    return (f"https://stabledomains.net/domain-search?q={quote(domain)}&ref={SD_REF}"
+            "&utm_source=affiliate&utm_medium=referral&utm_campaign=dropfinder")
+
+
+def name_flags(domain):
+    label = domain.split(".")[0]
+    flags = []
+    if SPAM_RE.search(label):
+        flags.append("spammy-name")
+    if len(label) > 20:
+        flags.append("long")
+    if re.search(r"\d", label) and "-" in label:
+        flags.append("digits+hyphens")
+    return flags
 
 
 class LinkParser(HTMLParser):
@@ -87,7 +132,10 @@ class LinkParser(HTMLParser):
 def extract_links(html, page_url, headers=None):
     """Return (external_link_records, internal_urls) for one page."""
     p = LinkParser()
-    p.feed(html)
+    try:
+        p.feed(html)
+    except Exception:  # noqa: BLE001 - broken markup: keep what we parsed
+        pass
     base = urljoin(page_url, p.base) if p.base else page_url
     robots = p.meta_robots + " " + ((headers or {}).get("X-Robots-Tag", "") or "").lower()
     robot_tokens = set(re.split(r"[\s,]+", robots))
@@ -100,11 +148,15 @@ def extract_links(html, page_url, headers=None):
         href = l["href"].strip()
         if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
             continue
-        url = urljoin(base, href)
-        u = urlparse(url)
-        if u.scheme not in ("http", "https") or not u.hostname:
+        try:
+            url = urljoin(base, href)
+            u = urlparse(url)
+            host = u.hostname
+        except ValueError:
             continue
-        tgt = registrable(u.hostname)
+        if u.scheme not in ("http", "https") or not host:
+            continue
+        tgt = registrable(host)
         if not tgt:
             continue
         if tgt == src_dom:
@@ -124,8 +176,9 @@ def extract_links(html, page_url, headers=None):
     return external, internal
 
 
-def fetch_html(url, session, timeout=15, max_bytes=2_000_000, url_ok=None):
-    """Fetch a page. If url_ok is given, redirects are followed by hand and every hop must pass it."""
+def fetch(url, session, timeout=15, max_bytes=2_000_000, url_ok=None, kinds=("html",)):
+    """GET a URL. Returns (text, headers, final_url) or None. Content-type must contain one of `kinds`
+    (None = anything). If url_ok is given, redirects are followed by hand and every hop must pass it."""
     for _ in range(6):
         r = session.get(url, timeout=timeout, stream=True, allow_redirects=url_ok is None)
         if url_ok is not None and r.is_redirect:
@@ -139,77 +192,204 @@ def fetch_html(url, session, timeout=15, max_bytes=2_000_000, url_ok=None):
     else:
         return None
     try:
-        if "html" not in r.headers.get("content-type", "").lower() or r.status_code >= 400:
+        ctype = r.headers.get("content-type", "").lower()
+        if r.status_code >= 400 or (kinds and not any(k in ctype for k in kinds)):
             return None
         raw = r.raw.read(max_bytes, decode_content=True)
+        if raw[:2] == b"\x1f\x8b":
+            try:
+                raw = gzip.decompress(raw)[:max_bytes * 5]
+            except OSError:
+                return None
         return raw.decode(r.encoding or "utf-8", errors="replace"), r.headers, r.url
     finally:
         r.close()
+
+
+def fetch_html(url, session, timeout=15, max_bytes=2_000_000, url_ok=None):
+    return fetch(url, session, timeout, max_bytes, url_ok, ("html",))
+
+
+_PUBLIC_CACHE = {}
 
 
 def is_public_host(host):
     """True if every address the host resolves to is a public internet address (SSRF guard)."""
     import ipaddress
     import socket
+    if host in _PUBLIC_CACHE:
+        return _PUBLIC_CACHE[host]
     try:
         infos = socket.getaddrinfo(host, None)
-    except (socket.gaierror, UnicodeError):
-        return False
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0].split("%")[0])
-        if not ip.is_global:
-            return False
-    return bool(infos)
+        ok = bool(infos) and all(ipaddress.ip_address(i[4][0].split("%")[0]).is_global for i in infos)
+    except (socket.gaierror, UnicodeError, ValueError):
+        ok = False
+    _PUBLIC_CACHE[host] = ok
+    return ok
+
+
+def public_url(url):
+    return is_public_host(urlparse(url).hostname or "")
+
+
+# --------------------------------------------------------------------------- authority
+class Authority:
+    """Tranco top-1M rank as a site-authority proxy (https://tranco-list.eu)."""
+    URL = "https://tranco-list.eu/top-1m.csv.zip"
+
+    def __init__(self, limit=None):
+        self.limit = limit or int(os.environ.get("TRANCO_LIMIT", 300_000))
+        self.rank, self.loaded, self.error, self.lock = {}, False, "", threading.Lock()
+
+    def load(self, log=lambda m: None):
+        with self.lock:
+            if self.loaded:
+                return self
+            self.loaded = True
+            try:
+                log("Loading Tranco top-sites ranking...")
+                r = requests.get(self.URL, timeout=90, headers={"User-Agent": UA})
+                r.raise_for_status()
+                z = zipfile.ZipFile(io.BytesIO(r.content))
+                with z.open(z.namelist()[0]) as f:
+                    for line in io.TextIOWrapper(f, "utf-8", errors="replace"):
+                        rk, _, dom = line.strip().partition(",")
+                        if not rk.isdigit():
+                            continue
+                        if int(rk) > self.limit:
+                            break
+                        reg = registrable(dom)
+                        if reg and reg not in self.rank:
+                            self.rank[reg] = int(rk)
+                log(f"  {len(self.rank):,} ranked sites loaded.")
+            except Exception as e:  # noqa: BLE001
+                self.error = f"{type(e).__name__}: {e}"
+                log(f"  Tranco unavailable ({self.error}); authority falls back to .edu/.gov only.")
+        return self
+
+    def get(self, domain):
+        return self.rank.get(domain)
+
+
+AUTH = Authority()
+
+
+def source_weight(domain):
+    """Authority multiplier for a linking site: Tranco tier, boosted for .edu/.gov-type sites."""
+    rk = AUTH.get(domain)
+    if rk is None:
+        w = 1.0
+    elif rk <= 1_000:
+        w = 6.0
+    elif rk <= 10_000:
+        w = 4.5
+    elif rk <= 100_000:
+        w = 3.0
+    else:
+        w = 2.0
+    if domain.endswith(EDU_GOV_SUFFIXES):
+        w = max(w, 3.0) * 1.5
+    return w
+
+
+def score_domain(records):
+    """Best link per linking site: authority weight x (1.0 dofollow, 0.15 nofollow), summed over sites."""
+    best = {}
+    for r in records:
+        pts = source_weight(r["source_domain"]) * (1.0 if r["follow"] == "dofollow" else 0.15)
+        best[r["source_domain"]] = max(best.get(r["source_domain"], 0), pts)
+    return round(sum(best.values()), 2)
+
+
+def open_pagerank(domains, key, session):
+    """Open PageRank (0-10) for domains. Free key at https://www.domcop.com/openpagerank/"""
+    out = {}
+    if not key:
+        return out
+    for i in range(0, len(domains), 100):
+        chunk = domains[i:i + 100]
+        try:
+            r = session.get("https://openpagerank.com/api/v1.0/getPageRank",
+                            params=[("domains[]", d) for d in chunk], headers={"API-OPR": key}, timeout=30)
+            for it in r.json().get("response", []):
+                if str(it.get("status_code")) == "200" and it.get("page_rank_decimal") not in (None, ""):
+                    out[it["domain"]] = float(it["page_rank_decimal"])
+        except (requests.RequestException, ValueError, TypeError):
+            pass
+    return out
+
+
+# --------------------------------------------------------------------------- crawling
+LOC_BLOCK = re.compile(r"<(?:\w+:)?(url|sitemap)\b[^>]*>(.*?)</(?:\w+:)?\1>", re.S | re.I)
+LOC_TAG = re.compile(r"<(?:\w+:)?loc>\s*(.*?)\s*</(?:\w+:)?loc>", re.S | re.I)
+LASTMOD_TAG = re.compile(r"<(?:\w+:)?lastmod>\s*(.*?)\s*</(?:\w+:)?lastmod>", re.S | re.I)
+
+
+def parse_sitemap(xml):
+    """Return [(kind, loc, lastmod)] where kind is 'url' or 'sitemap'. Regex based: no entity expansion."""
+    out = []
+    for kind, body in LOC_BLOCK.findall(xml):
+        loc = LOC_TAG.search(body)
+        if loc:
+            lm = LASTMOD_TAG.search(body)
+            out.append((kind.lower(), htmllib.unescape(loc.group(1).strip()), lm.group(1).strip() if lm else ""))
+    return out
 
 
 class Crawler:
-    """Polite crawler: obeys robots.txt, rate-limits per host."""
+    """Polite crawler: obeys robots.txt, rate-limits per host, optional SSRF guard and deadline."""
 
-    def __init__(self, delay=1.0, public_only=False):
+    def __init__(self, delay=1.0, public_only=False, deadline=None):
         self.s = requests.Session()
         self.s.headers["User-Agent"] = UA
         self.s.max_redirects = 5
         self.delay, self.robots, self.last, self.lock = delay, {}, {}, threading.Lock()
-        self.public_only, self.host_ok = public_only, {}
+        self.public_only, self.deadline = public_only, deadline
 
-    def allowed(self, url):
+    def expired(self):
+        return self.deadline is not None and time.time() > self.deadline
+
+    def robots_for(self, url):
         u = urlparse(url)
-        if self.public_only:
-            ok = self.host_ok.get(u.hostname)
-            if ok is None:
-                ok = self.host_ok[u.hostname] = is_public_host(u.hostname)
-            if not ok:
-                return False
         rp = self.robots.get(u.netloc)
         if rp is None:
             rp = urllib.robotparser.RobotFileParser()
             try:
-                r = self.s.get(f"{u.scheme}://{u.netloc}/robots.txt", timeout=10,
-                               allow_redirects=not self.public_only)
+                r = self.s.get(f"{u.scheme}://{u.netloc}/robots.txt", timeout=10, allow_redirects=not self.public_only)
                 rp.parse(r.text.splitlines() if r.status_code == 200 else [])
             except requests.RequestException:
                 rp.parse([])
             self.robots[u.netloc] = rp
-        return rp.can_fetch(UA, url)
+        return rp
 
-    def get(self, url):
-        if not self.allowed(url):
-            return None
-        host = urlparse(url).netloc
+    def allowed(self, url):
+        u = urlparse(url)
+        if not u.hostname or (self.public_only and not is_public_host(u.hostname)):
+            return False
+        return self.robots_for(url).can_fetch(UA, url)
+
+    def _wait_turn(self, host):
         with self.lock:
             slot = max(time.time(), self.last.get(host, 0) + self.delay)
             self.last[host] = slot
         if slot > time.time():
             time.sleep(slot - time.time())
+
+    def get(self, url, kinds=("html",), max_bytes=2_000_000):
+        if self.expired() or not self.allowed(url):
+            return None
+        self._wait_turn(urlparse(url).netloc)
         try:
-            return fetch_html(url, self.s, url_ok=self.allowed if self.public_only else None)
+            return fetch(url, self.s, url_ok=self.allowed if self.public_only else None, kinds=kinds,
+                         max_bytes=max_bytes)
         except requests.RequestException:
             return None
 
     def crawl(self, seed, depth, max_pages):
+        """Breadth-first crawl inside one site, starting at seed."""
         host = urlparse(seed).netloc
         seen, queue, out, n = {seed}, [(seed, 0)], [], 0
-        while queue and n < max_pages:
+        while queue and n < max_pages and not self.expired():
             url, d = queue.pop(0)
             res = self.get(url)
             if not res:
@@ -225,9 +405,58 @@ class Crawler:
                         queue.append((u, d + 1))
         return out
 
+    def old_pages(self, root, k=8, max_child=3):
+        """The k oldest page URLs from a site's sitemap(s) (by <lastmod>; undated entries count as old)."""
+        u = urlparse(root)
+        base = f"{u.scheme}://{u.netloc}"
+        maps = list(self.robots_for(base + "/").site_maps() or []) or [base + "/sitemap.xml"]
+        site = registrable(u.hostname or "")
+        urls, todo, seen = [], maps[:3], set()
+        while todo and len(seen) < max_child + 3 and not self.expired():
+            sm = todo.pop(0)
+            if sm in seen:
+                continue
+            seen.add(sm)
+            res = self.get(sm, kinds=None, max_bytes=5_000_000)
+            if not res:
+                continue
+            entries = parse_sitemap(res[0])
+            children = sorted([e for e in entries if e[0] == "sitemap"], key=lambda e: (e[2] or "0000", e[1]))
+            # prefer post/article sitemaps, oldest first
+            children.sort(key=lambda e: (not re.search(r"post|article|blog|news|page", e[1], re.I),))
+            todo.extend(c[1] for c in children[:max_child])
+            urls.extend(e for e in entries if e[0] == "url")
+        urls = [e for e in urls if registrable(urlparse(e[1]).hostname or "") == site and not SKIP_EXT.search(e[1])]
+        urls.sort(key=lambda e: e[2] or "0000")
+        picked, seen_u = [], set()
+        for _, loc, _ in urls:
+            if loc not in seen_u:
+                seen_u.add(loc)
+                picked.append(loc)
+            if len(picked) >= k:
+                break
+        return picked
+
+    def crawl_site(self, root, old_k=8, fallback_pages=6):
+        """Old pages from the sitemap (best for dead links) plus the homepage; falls back to a shallow crawl."""
+        if not root.startswith(("http://", "https://")):
+            root = "https://" + root.strip("/") + "/"
+        out = []
+        pages = self.old_pages(root, k=old_k) if old_k else []
+        if pages:
+            for p in pages + [root]:
+                res = self.get(p)
+                if res:
+                    out.extend(extract_links(res[0], res[2], res[1])[0])
+        else:
+            out = self.crawl(root, 1, fallback_pages)
+        return out
+
 
 # --------------------------------------------------------------------------- harvesters
 WIKI_API = "https://en.wikipedia.org/w/api.php"
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+          "November", "December"]
 
 
 def wikipedia_links(category, limit):
@@ -253,9 +482,12 @@ def wikipedia_links(category, limit):
             for p in r.get("query", {}).get("pages", []):
                 src = "https://en.wikipedia.org/wiki/" + p["title"].replace(" ", "_")
                 for el in p.get("extlinks", []):
-                    url = el["url"]
+                    url = el.get("url", "")
                     url = "https:" + url if url.startswith("//") else url
-                    dom = registrable(urlparse(url).hostname)
+                    try:
+                        dom = registrable(urlparse(url).hostname)
+                    except ValueError:
+                        continue
                     if dom and dom != "wikipedia.org":
                         out.append(dict(source_url=src, source_domain="wikipedia.org", target_url=url,
                                         target_domain=dom, anchor="", follow="nofollow", reason="platform policy"))
@@ -263,6 +495,14 @@ def wikipedia_links(category, limit):
                 break
             cont = r["continue"]
     return out
+
+
+def random_dead_link_categories(n, rng=random):
+    """Wikipedia maintenance categories 'Articles with dead external links from <Month> <Year>'."""
+    year_now = datetime.now(timezone.utc).year
+    cats = {f"Category:Articles with dead external links from {rng.choice(MONTHS)} {rng.randint(2010, year_now - 1)}"
+            for _ in range(n * 3)}
+    return sorted(cats)[:n]
 
 
 def github_links(query, limit):
@@ -281,6 +521,12 @@ def github_links(query, limit):
         if rr.status_code == 200:
             out.extend(extract_links(rr.text, f"https://github.com/{full}")[0])
     return out
+
+
+def sample_ranked_sites(n, lo=2_000, hi=300_000, rng=random):
+    """n random sites from the Tranco ranking between ranks lo and hi."""
+    pool = [d for d, rk in AUTH.rank.items() if lo <= rk <= hi and d not in IGNORE_TARGETS]
+    return rng.sample(pool, min(n, len(pool)))
 
 
 # --------------------------------------------------------------------------- availability
@@ -315,6 +561,8 @@ def parse_rdap(j):
         state = "pending_delete"
     elif any("redemption" in s for s in statuses):
         state = "redemption"
+    elif any("renew period" in s for s in statuses):
+        state = "grace"
     return {"registration": state, "expiry": expiry or "", "statuses": ";".join(statuses)}
 
 
@@ -341,6 +589,14 @@ def rdap_lookup(domain, base, session, limiter, retries=3):
     return {"registration": "unknown", "note": "rdap unreachable"}
 
 
+def make_resolver(nameserver=None):
+    import dns.resolver
+    res = dns.resolver.Resolver(configure=False)
+    res.nameservers = [nameserver] if nameserver else ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+    res.lifetime = 6
+    return res
+
+
 def dns_status(domain, resolver):
     import dns.exception
     import dns.resolver
@@ -353,6 +609,30 @@ def dns_status(domain, resolver):
         return "no_ns_answer"
     except (dns.resolver.NoNameservers, dns.exception.Timeout):
         return "dns_error"
+    except Exception:  # noqa: BLE001 - e.g. malformed names
+        return "dns_error"
+
+
+def site_state(domain, session, public_only=False):
+    """Visit the homepage: 'live', 'parked' (for-sale / expired / parking page), 'moved' or 'dead'."""
+    ok = public_url if public_only else None
+    for scheme in ("https", "http"):
+        try:
+            res = fetch(f"{scheme}://{domain}/", session, timeout=8, max_bytes=300_000, url_ok=ok, kinds=None)
+        except requests.RequestException:
+            continue
+        if not res:
+            continue
+        text, _, final = res
+        final_dom = registrable(urlparse(final).hostname or "")
+        if PARK_RE.search(text[:300_000]) or (final_dom and PARK_RE.search(final_dom)):
+            return "parked"
+        if final_dom and final_dom != domain:
+            return "moved"
+        if len(text.strip()) < 200:
+            return "parked"
+        return "live"
+    return "dead"
 
 
 def wayback_summary(domain, session):
@@ -364,8 +644,42 @@ def wayback_summary(domain, session):
     except (requests.RequestException, ValueError):
         return {}
     if not rows:
-        return {"wb_first": "", "wb_last": "", "wb_months": 0}
-    return {"wb_first": rows[0][0][:4], "wb_last": rows[-1][0][:4], "wb_months": len(rows)}
+        return {"wb_first": "", "wb_last": "", "wb_months": 0, "wb_years": 0}
+    first, last = rows[0][0][:4], rows[-1][0][:4]
+    return {"wb_first": first, "wb_last": last, "wb_months": len(rows), "wb_years": int(last) - int(first) + 1}
+
+
+def stabledomains_check(domain, session):
+    """Confirm availability + price with StableDomains (affiliate checkout)."""
+    try:
+        r = session.get("https://stabledomains.net/api/v1/availability", params={"domain": domain}, timeout=20)
+        j = r.json()
+    except (requests.RequestException, ValueError):
+        return {}
+
+    def walk(o):
+        yield o
+        if isinstance(o, dict):
+            for v in o.values():
+                yield from walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                yield from walk(v)
+
+    for o in walk(j):
+        if isinstance(o, dict) and str(o.get("domain", "")).lower() == domain:
+            av = o.get("availability", o.get("available", o.get("status")))
+            if av is True or str(av).lower() in ("available", "true", "free"):
+                avs = "yes"
+            elif av is False or str(av).lower() in ("taken", "registered", "unavailable", "false"):
+                avs = "no"
+            else:
+                avs = str(av or "")
+            price = o.get("total_usd") or o.get("first_year_usd") or o.get("price_usd") or o.get("price") or ""
+            if isinstance(price, dict):
+                price = price.get("usd") or price.get("total") or ""
+            return {"sd_available": avs, "sd_price": str(price), "premium": bool(o.get("premium"))}
+    return {}
 
 
 def label(rec, expiring_days):
@@ -376,60 +690,85 @@ def label(rec, expiring_days):
         return "PENDING_DELETE"
     if reg == "redemption":
         return "REDEMPTION"
-    if reg == "no_rdap" and rec["dns"] == "nxdomain":
+    if reg == "grace":
+        return "EXPIRED_GRACE"
+    if reg == "no_rdap" and rec.get("dns") == "nxdomain":
         return "LIKELY_AVAILABLE"
-    if reg == "registered" and rec.get("expiry"):
+    if reg in ("registered", "unknown") and rec.get("expiry"):
         try:
             exp = datetime.fromisoformat(rec["expiry"].replace("Z", "+00:00"))
             if exp.tzinfo is None:
                 exp = exp.replace(tzinfo=timezone.utc)
-            if exp < datetime.now(timezone.utc) + timedelta(days=expiring_days):
+            now = datetime.now(timezone.utc)
+            if exp < now:
+                return "EXPIRED_GRACE"
+            if exp < now + timedelta(days=expiring_days):
                 return "EXPIRING_SOON"
         except ValueError:
             pass
+    if rec.get("site") == "parked":
+        return "PARKED"
+    if rec.get("site") == "dead":
+        return "DEAD_SITE"
     return "REGISTERED"
 
 
-# --------------------------------------------------------------------------- scoring
-def source_weight(domain):
-    return 3.0 if domain.endswith(EDU_GOV_SUFFIXES) else 1.0
-
-
-def score_domain(records):
-    """Best link per source domain: dofollow = 2 pts, nofollow = 0.25, x3 for .edu/.gov-type sources."""
-    best = {}
-    for r in records:
-        pts = source_weight(r["source_domain"]) * (2.0 if r["follow"] == "dofollow" else 0.25)
-        best[r["source_domain"]] = max(best.get(r["source_domain"], 0), pts)
-    return round(sum(best.values()), 2)
-
-
-PRIORITY = {"AVAILABLE": 0, "PENDING_DELETE": 1, "REDEMPTION": 2, "LIKELY_AVAILABLE": 3, "EXPIRING_SOON": 4, "REGISTERED": 9}
+PRIORITY = {"AVAILABLE": 0, "PENDING_DELETE": 1, "REDEMPTION": 2, "EXPIRED_GRACE": 3, "LIKELY_AVAILABLE": 4,
+            "EXPIRING_SOON": 5, "PARKED": 6, "DEAD_SITE": 7, "REGISTERED": 9}
+BUYABLE = {"AVAILABLE", "LIKELY_AVAILABLE"}
 
 
 # --------------------------------------------------------------------------- library api
-CSV_COLS = ["domain", "status", "score", "dofollow_sources", "nofollow_only_sources", "edu_gov_sources", "expiry",
-            "dns", "wb_first", "wb_last", "wb_months", "best_source_url", "best_anchor", "link_target_url",
-            "more_sources"]
+CSV_COLS = ["domain", "status", "score", "dofollow_sources", "nofollow_only_sources", "edu_gov_sources",
+            "best_source_rank", "opr", "expiry", "dns", "site", "wb_first", "wb_last", "wb_years", "wb_months",
+            "sd_available", "sd_price", "flags", "best_source_url", "best_anchor", "link_target_url", "buy_url",
+            "more_sources", "first_seen", "last_checked"]
 
 
 def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categories=(), wiki_limit=300,
-            github_query=None, github_limit=30, public_only=False, log=lambda msg: None):
-    """Collect outbound link records from seed pages, Wikipedia categories and GitHub READMEs."""
-    crawler = Crawler(delay=delay, public_only=public_only)
+            github_query=None, github_limit=30, public_only=False, sitemaps=False, ranked_sites=(),
+            deadline=None, log=lambda msg: None):
+    """Collect outbound link records from seeds, ranked sites' old pages, Wikipedia and GitHub."""
+    crawler = Crawler(delay=delay, public_only=public_only, deadline=deadline)
     records = []
-    seeds = list(seeds)
+    seeds, ranked_sites = list(seeds), list(ranked_sites)
+    lock = threading.Lock()
+    done = [0]
+
+    def one_seed(s):
+        recs = crawler.crawl_site(s, old_k=8) if sitemaps else crawler.crawl(s, depth, max_pages)
+        return s, recs
+
+    def one_ranked(d):
+        try:
+            recs = crawler.crawl_site(d, old_k=8)
+        except Exception:  # noqa: BLE001 - one bad site must not kill the run
+            recs = []
+        with lock:
+            done[0] += 1
+            if done[0] % 20 == 0:
+                log(f"  {done[0]}/{len(ranked_sites)} ranked sites crawled, {len(records) + len(recs)} links so far")
+        return recs
+
     if seeds:
-        log(f"Crawling {len(seeds)} seed page(s)...")
+        log(f"Crawling {len(seeds)} seed page(s){' (oldest sitemap pages)' if sitemaps else ''}...")
         with ThreadPoolExecutor(max(1, workers)) as ex:
-            for seed, recs in zip(seeds, ex.map(lambda s: crawler.crawl(s, depth, max_pages), seeds)):
+            for seed, recs in ex.map(one_seed, seeds):
                 log(f"  {seed}: {len(recs)} external links")
                 records.extend(recs)
+    if ranked_sites:
+        log(f"Crawling the oldest pages of {len(ranked_sites)} ranked sites...")
+        with ThreadPoolExecutor(max(1, workers)) as ex:
+            for recs in ex.map(one_ranked, ranked_sites):
+                records.extend(recs)
+        log(f"  ranked sites gave {len(records)} links")
     for cat in wiki_categories or []:
+        if crawler.expired():
+            break
         log(f"Reading Wikipedia {cat}...")
         try:
             recs = wikipedia_links(cat, wiki_limit)
-        except (requests.RequestException, ValueError) as e:
+        except (requests.RequestException, ValueError, KeyError) as e:
             log(f"  Wikipedia failed: {e}")
             recs = []
         log(f"  {len(recs)} external links")
@@ -438,17 +777,58 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
         log(f"Searching GitHub for '{github_query}'...")
         try:
             recs = github_links(github_query, github_limit)
-        except (requests.RequestException, ValueError) as e:
+        except (requests.RequestException, ValueError, KeyError) as e:
             log(f"  GitHub failed: {e}")
             recs = []
         log(f"  {len(recs)} external links")
         records.extend(recs)
-    return records
+    return [r for r in records if r["target_domain"] not in IGNORE_TARGETS]
+
+
+def status_check(domains, resolver_ip=None, rdap_all=False, expiring_days=45, rdap_interval=0.3, workers=40,
+                 site_check=(), public_only=False, log=lambda msg: None):
+    """DNS + RDAP (+ homepage visit for domains in site_check) -> {domain: status record}."""
+    resolver = make_resolver(resolver_ip)
+    session = requests.Session()
+    session.headers["User-Agent"] = UA
+    bootstrap = load_rdap_bootstrap(session)
+    limiters = {}
+    site_check = set(site_check)
+    done, lock = [0], threading.Lock()
+
+    def rdap(domain):
+        base = bootstrap.get(domain.rsplit(".", 1)[-1])
+        if not base:
+            return {"registration": "no_rdap"}
+        with lock:  # one rate limit per registry RDAP server
+            limiter = limiters.setdefault(base, RateLimiter(rdap_interval))
+        return rdap_lookup(domain, base, session, limiter)
+
+    def check_one(domain):
+        rec = {"domain": domain, "dns": dns_status(domain, resolver)}
+        if rec["dns"] in ("nxdomain", "dns_error", "no_ns_answer") or rdap_all:
+            rec.update(rdap(domain))
+        else:
+            rec["registration"] = "registered"
+            if domain in site_check:
+                rec["site"] = site_state(domain, session, public_only)
+                if rec["site"] in ("dead", "parked"):
+                    rec.update(rdap(domain))
+        rec["status"] = label(rec, expiring_days)
+        with lock:
+            done[0] += 1
+            if done[0] % 100 == 0 or done[0] == len(domains):
+                log(f"  checked {done[0]}/{len(domains)}")
+        return rec
+
+    with ThreadPoolExecutor(max(1, workers)) as ex:
+        return {r["domain"]: r for r in ex.map(check_one, domains)}
 
 
 def check(records, dofollow_only=False, min_sources=1, tlds=None, resolver_ip=None, rdap_all=False,
           expiring_days=45, rdap_interval=0.3, workers=40, wayback=False, wayback_top=100, include_all=False,
-          max_domains=None, log=lambda msg: None):
+          max_domains=None, site_check_top=0, verify=False, opr_key=None, public_only=False,
+          log=lambda msg: None):
     """Check availability of every linked-to domain. Returns ranked result rows."""
     by = defaultdict(list)
     for r in records:
@@ -460,63 +840,73 @@ def check(records, dofollow_only=False, min_sources=1, tlds=None, resolver_ip=No
     if tlds:
         keep = {t.strip().lstrip(".").lower() for t in tlds if t.strip()}
         domains = [d for d in domains if d.rsplit(".", 1)[-1] in keep]
+    scores = {d: score_domain(by[d]) for d in domains}
+    domains.sort(key=lambda d: -scores[d])
     if max_domains and len(domains) > max_domains:
-        domains.sort(key=lambda d: -score_domain(by[d]))
         log(f"Limiting to the {max_domains} best-linked of {len(domains)} domains.")
         domains = domains[:max_domains]
-    log(f"Checking {len(domains)} domains...")
+    log(f"Checking {len(domains)} domains (DNS/RDAP{', dead-site scan of top ' + str(site_check_top) if site_check_top else ''})...")
+    results = status_check(domains, resolver_ip, rdap_all, expiring_days, rdap_interval, workers,
+                           site_check=domains[:site_check_top], public_only=public_only, log=log)
+    rows = [build_row(rec, by[rec["domain"]], scores[rec["domain"]]) for rec in results.values()
+            if include_all or rec["status"] != "REGISTERED"]
+    rows.sort(key=lambda r: (PRIORITY.get(r["status"], 9), -r["score"]))
+    enrich(rows, wayback=wayback, wayback_top=wayback_top, verify=verify, opr_key=opr_key, log=log)
+    return rows
 
-    import dns.resolver
-    resolver = dns.resolver.Resolver()
-    if resolver_ip:
-        resolver.nameservers = [resolver_ip]
-    resolver.lifetime = 6
+
+def build_row(rec, rs, score):
+    df = {r["source_domain"] for r in rs if r["follow"] == "dofollow"}
+    nf = {r["source_domain"] for r in rs} - df
+    ordered = sorted(rs, key=lambda r: (r["follow"] != "dofollow", -source_weight(r["source_domain"])))
+    best = ordered[0]
+    ranks = [AUTH.get(s) for s in df | nf if AUTH.get(s)]
+    sources, seen = [], set()
+    for r in ordered:
+        if r["source_url"] in seen:
+            continue
+        seen.add(r["source_url"])
+        sources.append({"url": r["source_url"], "domain": r["source_domain"], "follow": r["follow"],
+                        "rank": AUTH.get(r["source_domain"]), "anchor": r["anchor"], "target": r["target_url"]})
+        if len(sources) >= 6:
+            break
+    return {"domain": rec["domain"], "status": rec["status"], "score": score,
+            "dofollow_sources": len(df), "nofollow_only_sources": len(nf),
+            "edu_gov_sources": sum(s.endswith(EDU_GOV_SUFFIXES) for s in df | nf),
+            "best_source_rank": min(ranks) if ranks else "",
+            "expiry": rec.get("expiry", ""), "dns": rec.get("dns", ""), "site": rec.get("site", ""),
+            "flags": ",".join(name_flags(rec["domain"])),
+            "best_source_url": best["source_url"], "best_anchor": best["anchor"], "link_target_url": best["target_url"],
+            "buy_url": buy_url(rec["domain"]),
+            "more_sources": " | ".join(s["url"] for s in sources[:5]), "sources": sources}
+
+
+def enrich(rows, wayback=False, wayback_top=100, verify=False, opr_key=None, log=lambda m: None):
     session = requests.Session()
     session.headers["User-Agent"] = UA
-    bootstrap = load_rdap_bootstrap(session)
-    limiter = RateLimiter(rdap_interval)
-    done = [0]
-    lock = threading.Lock()
-
-    def check_one(domain):
-        rec = {"domain": domain, "dns": dns_status(domain, resolver)}
-        if rec["dns"] in ("nxdomain", "dns_error") or rdap_all:
-            base = bootstrap.get(domain.rsplit(".", 1)[-1])
-            rec.update(rdap_lookup(domain, base, session, limiter) if base else {"registration": "no_rdap"})
-        else:
-            rec["registration"] = "registered"
-        rec["status"] = label(rec, expiring_days)
-        with lock:
-            done[0] += 1
-            if done[0] % 25 == 0 or done[0] == len(domains):
-                log(f"  checked {done[0]}/{len(domains)}")
-        return rec
-
-    with ThreadPoolExecutor(max(1, workers)) as ex:
-        results = list(ex.map(check_one, domains))
-
-    rows = []
-    for rec in results:
-        if rec["status"] == "REGISTERED" and not include_all:
-            continue
-        rs = by[rec["domain"]]
-        df = {r["source_domain"] for r in rs if r["follow"] == "dofollow"}
-        nf = {r["source_domain"] for r in rs} - df
-        best = sorted(rs, key=lambda r: (r["follow"] != "dofollow", -source_weight(r["source_domain"])))[0]
-        rows.append({"domain": rec["domain"], "status": rec["status"], "score": score_domain(rs),
-                     "dofollow_sources": len(df), "nofollow_only_sources": len(nf),
-                     "edu_gov_sources": sum(source_weight(s) > 1 for s in df | nf),
-                     "expiry": rec.get("expiry", ""), "dns": rec["dns"],
-                     "best_source_url": best["source_url"], "best_anchor": best["anchor"],
-                     "link_target_url": best["target_url"],
-                     "more_sources": " | ".join(sorted({r["source_url"] for r in rs})[:5])})
-    rows.sort(key=lambda r: (PRIORITY.get(r["status"], 9), -r["score"]))
-
     if wayback and rows:
-        log(f"Pulling Wayback history for top {min(len(rows), wayback_top)}...")
-        for row in rows[:wayback_top]:
-            row.update(wayback_summary(row["domain"], session))
-    return rows
+        top = rows[:wayback_top]
+        log(f"Pulling Wayback history for {len(top)} domains...")
+        with ThreadPoolExecutor(4) as ex:
+            for row, wb in zip(top, ex.map(lambda r: wayback_summary(r["domain"], session), top)):
+                row.update(wb)
+    if verify:
+        avail = [r for r in rows if r["status"] in BUYABLE][:150]
+        if avail:
+            log(f"Confirming {len(avail)} available domains with StableDomains...")
+            for r in avail:
+                info = stabledomains_check(r["domain"], session)
+                r.update(info)
+                if info.get("sd_available") == "yes" and r["status"] == "LIKELY_AVAILABLE":
+                    r["status"] = "AVAILABLE"
+                time.sleep(0.5)
+    if opr_key and rows:
+        log("Fetching Open PageRank...")
+        pr = open_pagerank([r["domain"] for r in rows[:1000]], opr_key, session)
+        for r in rows:
+            if r["domain"] in pr:
+                r["opr"] = pr[r["domain"]]
+    rows.sort(key=lambda r: (PRIORITY.get(r["status"], 9), -r["score"]))
 
 
 def write_csv(rows, f):
@@ -525,13 +915,100 @@ def write_csv(rows, f):
     w.writerows(rows)
 
 
+# --------------------------------------------------------------------------- automatic hunt
+def load_data(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"domains": {}, "runs": []}
+
+
+def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_minutes=40, sites=250,
+         wiki_months=4, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=5000,
+         seed=None, log=print):
+    """Fully automatic run: ranked sites' old pages + Wikipedia dead-link months + your seeds.txt,
+    then check, verify and merge into the data file."""
+    t0 = time.time()
+    rng = random.Random(seed)
+    AUTH.load(log)
+    ranked = sample_ranked_sites(sites, rng=rng) if AUTH.rank else []
+    my_seeds = []
+    if seeds_file and os.path.exists(seeds_file):
+        my_seeds = [l.strip() for l in open(seeds_file) if l.strip() and not l.lstrip().startswith("#")]
+    cats = random_dead_link_categories(wiki_months, rng)
+    deadline = t0 + budget_minutes * 60 * 0.55
+    records = harvest(my_seeds, sitemaps=True, ranked_sites=ranked, wiki_categories=cats, wiki_limit=wiki_limit,
+                      workers=workers, deadline=deadline, log=log)
+    log(f"Harvested {len(records)} links ({sum(r['follow'] == 'dofollow' for r in records)} dofollow) "
+        f"to {len({r['target_domain'] for r in records})} domains in {int(time.time() - t0)}s.")
+
+    data = load_data(data_path)
+    old = data.get("domains", {})
+    rows = check(records, workers=40, wayback=True, wayback_top=300, verify=True, opr_key=opr_key,
+                 site_check_top=1500, max_domains=20000, log=log)
+    stamp = now_iso()
+    for r in rows:
+        prev = old.get(r["domain"])
+        r["first_seen"] = prev.get("first_seen", stamp) if prev else stamp
+        r["last_checked"] = stamp
+        if prev:  # keep the best evidence we have seen
+            if prev.get("score", 0) > r["score"]:
+                r["score"], r["sources"] = prev["score"], prev.get("sources", r["sources"])
+                r["dofollow_sources"] = max(r["dofollow_sources"], prev.get("dofollow_sources", 0))
+            for k in ("wb_first", "wb_last", "wb_years", "wb_months", "opr"):
+                if k not in r and k in prev:
+                    r[k] = prev[k]
+        old[r["domain"]] = r
+
+    # re-check domains found in earlier runs that were not re-found this time
+    fresh = {r["domain"] for r in rows}
+    stale = [d for d, r in old.items() if d not in fresh and r.get("status") != "TAKEN"]
+    if stale:
+        log(f"Re-checking {len(stale)} domains from earlier runs...")
+        recs = status_check(stale, site_check=[d for d in stale if old[d].get("status") in ("PARKED", "DEAD_SITE")],
+                            log=log)
+        for d, rec in recs.items():
+            r = old[d]
+            if rec["status"] == "REGISTERED":
+                r["status"], r["taken_at"] = "TAKEN", stamp
+            else:
+                r.update(status=rec["status"], expiry=rec.get("expiry", r.get("expiry", "")), dns=rec.get("dns", ""),
+                         site=rec.get("site", r.get("site", "")), last_checked=stamp)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    old = {d: r for d, r in old.items() if not (r.get("status") == "TAKEN" and r.get("taken_at", "") < cutoff)}
+    keep = sorted(old.values(), key=lambda r: (r.get("status") == "TAKEN", PRIORITY.get(r.get("status"), 9),
+                                               -r.get("score", 0)))[:max_keep]
+    counts = defaultdict(int)
+    for r in keep:
+        counts[r["status"]] += 1
+    run = {"at": stamp, "seconds": int(time.time() - t0), "ranked_sites": len(ranked), "wiki_categories": cats,
+           "links": len(records), "new_candidates": len([r for r in rows if r["first_seen"] == stamp]),
+           "counts": dict(counts)}
+    data = {"updated": stamp, "tranco_loaded": bool(AUTH.rank), "runs": ([run] + data.get("runs", []))[:30],
+            "domains": {r["domain"]: r for r in keep}}
+    os.makedirs(os.path.dirname(data_path) or ".", exist_ok=True)
+    with open(data_path, "w") as f:
+        json.dump(data, f, separators=(",", ":"))
+    if csv_path:
+        with open(csv_path, "w", newline="") as f:
+            write_csv([r for r in keep if r["status"] != "TAKEN"], f)
+    log(f"Done in {int(time.time() - t0)}s: {run['new_candidates']} new, {len(keep)} tracked. {dict(counts)}")
+    return data
+
+
 # --------------------------------------------------------------------------- commands
 def cmd_harvest(a):
     seeds = []
     if a.seeds:
         seeds = [l.strip() for l in open(a.seeds) if l.strip() and not l.startswith("#")]
+    ranked = []
+    if a.ranked_sites:
+        AUTH.load(lambda m: print(m, file=sys.stderr))
+        ranked = sample_ranked_sites(a.ranked_sites)
     records = harvest(seeds, a.depth, a.max_pages, a.delay, a.workers, a.wikipedia_category, a.wiki_limit,
-                      a.github_query, a.github_limit, log=lambda m: print(m, file=sys.stderr))
+                      a.github_query, a.github_limit, sitemaps=a.sitemaps, ranked_sites=ranked,
+                      log=lambda m: print(m, file=sys.stderr))
     with open(a.out, "w") as f:
         for r in records:
             f.write(json.dumps(r) + "\n")
@@ -542,8 +1019,11 @@ def cmd_harvest(a):
 
 def cmd_check(a):
     recs = [json.loads(l) for l in open(a.links)]
+    if not a.no_authority:
+        AUTH.load(lambda m: print(m, file=sys.stderr))
     rows = check(recs, a.dofollow_only, a.min_sources, a.tlds.split(",") if a.tlds else None, a.resolver,
                  a.rdap_all, a.expiring_days, a.rdap_interval, a.workers, a.wayback, a.wayback_top, a.all,
+                 site_check_top=a.site_check, verify=a.verify, opr_key=os.environ.get("OPR_API_KEY"),
                  log=lambda m: print(m, file=sys.stderr))
     with open(a.out, "w", newline="") as f:
         write_csv(rows, f)
@@ -552,6 +1032,10 @@ def cmd_check(a):
         print(f"  {r['status']:<16} {r['domain']:<32} score={r['score']:<6} dofollow={r['dofollow_sources']}")
 
 
+def cmd_hunt(a):
+    hunt(a.data, a.csv, a.budget_minutes, a.sites, a.wiki_months, a.wiki_limit, a.seeds,
+         os.environ.get("OPR_API_KEY"), a.workers, seed=a.random_seed, log=lambda m: print(m, flush=True))
+
 
 def selftest():
     html = """<html><head><meta name="robots" content="index,follow"></head><body>
@@ -559,6 +1043,7 @@ def selftest():
     <a href="https://gone-startup.io/">Gone <b>Startup</b></a>
     <a href="/internal">in</a><a href="mailto:a@b.c">m</a>
     <a href="https://sponsor.com" rel="sponsored noopener">s</a>
+    <a href="http://[bad">broken</a>
     <a href="https://old-lab.example.co.uk/x">lab</a></body></html>"""
     ext, internal = extract_links(html, "https://blog.mysite.com/post")
     by = {e["target_domain"]: e for e in ext}
@@ -571,20 +1056,31 @@ def selftest():
     assert all(e["follow"] == "nofollow" for e in ext)
     ext, _ = extract_links(html, "https://en.wikipedia.org/wiki/X")
     assert all(e["follow"] == "nofollow" for e in ext)
-    assert {e["target_domain"]: e["reason"] for e in ext}["gone-startup.io"] == "platform policy"
     ext, _ = extract_links(html, "https://x.org/", headers={"X-Robots-Tag": "noindex, nofollow"})
     assert all(e["follow"] == "nofollow" for e in ext)
     assert registrable("www.cs.mit.edu") == "mit.edu" and registrable("192.168.0.1") == ""
     p = parse_rdap({"status": ["client hold", "pending delete"],
                     "events": [{"eventAction": "expiration", "eventDate": "2026-12-01T00:00:00Z"}]})
     assert p["registration"] == "pending_delete" and p["expiry"].startswith("2026-12-01")
+    assert parse_rdap({"status": ["auto renew period"]})["registration"] == "grace"
     assert label({"registration": "available", "dns": "nxdomain"}, 45) == "AVAILABLE"
     assert label({"registration": "no_rdap", "dns": "nxdomain"}, 45) == "LIKELY_AVAILABLE"
     soon = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
+    past = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
     assert label({"registration": "registered", "dns": "has_ns", "expiry": soon}, 45) == "EXPIRING_SOON"
+    assert label({"registration": "registered", "dns": "has_ns", "expiry": past}, 45) == "EXPIRED_GRACE"
+    assert label({"registration": "registered", "dns": "has_ns", "site": "parked"}, 45) == "PARKED"
+    AUTH.rank = {"bigsite.com": 500, "midsite.com": 50_000}
     recs = [dict(source_domain="mit.edu", follow="dofollow"), dict(source_domain="mit.edu", follow="nofollow"),
-            dict(source_domain="blog.com", follow="nofollow")]
-    assert score_domain(recs) == 6.25
+            dict(source_domain="blog.com", follow="nofollow"), dict(source_domain="bigsite.com", follow="dofollow")]
+    assert score_domain(recs) == round(4.5 + 0.15 + 6.0, 2), score_domain(recs)
+    sm = """<?xml version="1.0"?><urlset><url><loc>https://a.com/new</loc><lastmod>2024-01-01</lastmod></url>
+    <url><loc>https://a.com/old?x=1&amp;y=2</loc><lastmod>2009-05-01</lastmod></url></urlset>"""
+    ps = parse_sitemap(sm)
+    assert ps[1] == ("url", "https://a.com/old?x=1&y=2", "2009-05-01"), ps
+    assert "spammy-name" in name_flags("best-casino-bonus.com") and not name_flags("oldlab.org")
+    assert "ref=" + SD_REF in buy_url("x.com")
+    AUTH.rank = {}
     print("selftest: all checks passed")
 
 
@@ -593,6 +1089,8 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     h = sub.add_parser("harvest", help="collect outbound links and classify dofollow/nofollow")
     h.add_argument("--seeds", help="text file, one page URL per line")
+    h.add_argument("--sitemaps", action="store_true", help="crawl each seed site's OLDEST sitemap pages")
+    h.add_argument("--ranked-sites", type=int, default=0, help="also crawl N random Tranco-ranked sites")
     h.add_argument("--depth", type=int, default=1, help="how many link-hops to follow within each seed's site")
     h.add_argument("--max-pages", type=int, default=30, help="max pages fetched per seed")
     h.add_argument("--delay", type=float, default=1.0, help="seconds between requests to the same host")
@@ -612,13 +1110,28 @@ def main():
     c.add_argument("--tlds", help="comma list of TLD labels to keep, e.g. com,net,org,io")
     c.add_argument("--resolver", help="DNS server to use, e.g. 1.1.1.1")
     c.add_argument("--rdap-all", action="store_true", help="RDAP-check every domain (finds EXPIRING_SOON; slow)")
+    c.add_argument("--site-check", type=int, default=500, help="visit the top N live domains to find dead/parked sites")
     c.add_argument("--expiring-days", type=int, default=45)
     c.add_argument("--rdap-interval", type=float, default=0.3, help="seconds between RDAP requests")
     c.add_argument("--workers", type=int, default=40)
     c.add_argument("--wayback", action="store_true", help="add Wayback Machine history to top results")
     c.add_argument("--wayback-top", type=int, default=100)
+    c.add_argument("--verify", action="store_true", help="confirm availability + price with StableDomains")
+    c.add_argument("--no-authority", action="store_true", help="skip loading the Tranco ranking")
     c.add_argument("--all", action="store_true", help="include registered domains in the output")
     c.set_defaults(fn=cmd_check)
+
+    k = sub.add_parser("hunt", help="fully automatic run, merges into a data file")
+    k.add_argument("--data", default="data/candidates.json")
+    k.add_argument("--csv", default="data/latest.csv")
+    k.add_argument("--budget-minutes", type=int, default=40)
+    k.add_argument("--sites", type=int, default=250, help="random Tranco-ranked sites to sample")
+    k.add_argument("--wiki-months", type=int, default=4, help="random Wikipedia dead-link months")
+    k.add_argument("--wiki-limit", type=int, default=150, help="articles per Wikipedia month")
+    k.add_argument("--seeds", default="seeds.txt", help="your own seed pages (optional)")
+    k.add_argument("--workers", type=int, default=24)
+    k.add_argument("--random-seed", type=int)
+    k.set_defaults(fn=cmd_hunt)
 
     sub.add_parser("selftest", help="offline tests").set_defaults(fn=lambda a: selftest())
     args = ap.parse_args()

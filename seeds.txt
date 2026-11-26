@@ -1,0 +1,3 @@
+# Optional: extra seed pages for the automatic hunt, one URL per line.
+# The hunt already finds its own pages (random Tranco-ranked sites + Wikipedia dead-link lists);
+# add high-authority resource pages here if you know good ones. Their oldest sitemap pages are read too.
