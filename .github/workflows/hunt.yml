@@ -7,10 +7,10 @@ on:
     inputs:
       sites:
         description: "Random ranked sites to scan"
-        default: "300"
+        default: "200"
       budget:
         description: "Time budget (minutes)"
-        default: "40"
+        default: "55"
 
 permissions:
   contents: write
@@ -22,7 +22,7 @@ concurrency:
 jobs:
   hunt:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,8 +37,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python dropfinder.py hunt \
-            --sites "${{ github.event.inputs.sites || '300' }}" \
-            --budget-minutes "${{ github.event.inputs.budget || '40' }}" \
+            --sites "${{ github.event.inputs.sites || '200' }}" \
+            --budget-minutes "${{ github.event.inputs.budget || '55' }}" \
             --data data/candidates.json --csv data/latest.csv
       - name: Commit results
         run: |
