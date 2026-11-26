@@ -70,7 +70,9 @@ IGNORE_TARGETS = {"google.com", "googleapis.com", "gstatic.com", "googleusercont
                   "linkedin.com", "github.com", "jsdelivr.net", "unpkg.com", "gravatar.com", "wordpress.org",
                   "wp.com", "addtoany.com", "sharethis.com", "feedburner.com", "creativecommons.org"}
 # Zones the public can't register in (government, education, military...).
-RESTRICTED_RE = re.compile(r"\.(gov|edu|mil|ac|nhs|police|sch|k12|gob|gouv|govt|int)(\.[a-z]{2,3})?$|\.(mod|parliament)\.uk$", re.I)
+RESTRICTED_RE = re.compile(r"\.(gov|edu|mil|ac|nhs|police|sch|k12|gob|gouv|govt|int|gc|fed|nic)(\.[a-z]{2,3})?$"
+                           r"|\.(mod|parliament)\.uk$|\.(state|k12|ci|co|cc|lib|tec|dst)\.[a-z]{2}\.us$|^(gc|fed)\.(ca|us)$",
+                           re.I)
 RESOURCE_RE = re.compile(r"(link|resource|blogroll|partner|directory|friends|useful|recommended|sites|websites|"
                          r"tools|references|bookmarks|further-reading|webliography|sponsor)", re.I)
 SPAM_RE = re.compile(r"(casino|poker|slot|bet(ting)?|gambl|viagra|cialis|pharma|pills|porn|sex|xxx|escort|adult|"
@@ -1168,7 +1170,9 @@ def label(rec, expiring_days):
         return "EXPIRED_GRACE"
     if reg == "no_rdap" and rec.get("dns") == "nxdomain":
         return "LIKELY_AVAILABLE"
-    if reg in ("registered", "unknown") and rec.get("expiry"):
+    # An expiry date only matters when the site is gone too: live sites (brands etc.) auto-renew.
+    site_gone = rec.get("site") in ("dead", "parked") or rec.get("dns") in ("nxdomain", "no_ns_answer", "dns_error")
+    if reg in ("registered", "unknown") and rec.get("expiry") and site_gone:
         try:
             exp = datetime.fromisoformat(rec["expiry"].replace("Z", "+00:00"))
             if exp.tzinfo is None:
@@ -1690,8 +1694,12 @@ def selftest():
     assert label({"registration": "no_rdap", "dns": "nxdomain"}, 45) == "LIKELY_AVAILABLE"
     soon = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
     past = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
-    assert label({"registration": "registered", "dns": "has_ns", "expiry": soon}, 45) == "EXPIRING_SOON"
-    assert label({"registration": "registered", "dns": "has_ns", "expiry": past}, 45) == "EXPIRED_GRACE"
+    assert label({"registration": "registered", "dns": "has_ns", "site": "dead", "expiry": soon}, 45) == "EXPIRING_SOON"
+    assert label({"registration": "registered", "dns": "has_ns", "site": "parked", "expiry": past}, 45) == "EXPIRED_GRACE"
+    assert label({"registration": "registered", "dns": "has_ns", "expiry": soon}, 45) == "REGISTERED"  # live brand
+    assert label({"registration": "registered", "dns": "nxdomain", "expiry": past}, 45) == "EXPIRED_GRACE"
+    for d in ("international.gc.ca", "fed.us", "dot.state.ny.us", "x.gouv.fr"):
+        assert RESTRICTED_RE.search(d), d
     assert label({"registration": "registered", "dns": "has_ns", "site": "parked"}, 45) == "PARKED"
     AUTH.rank = {"bigsite.com": 500, "midsite.com": 50_000}
     recs = [dict(source_domain="mit.edu", follow="dofollow"), dict(source_domain="mit.edu", follow="nofollow"),
