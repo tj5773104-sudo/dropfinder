@@ -437,7 +437,9 @@ Register links go to StableDomains (affiliate).</footer>
   const status = new Set();
   const GROUPS = {"Available":["AVAILABLE","LIKELY_AVAILABLE"],"Dropping":["PENDING_DELETE","REDEMPTION","EXPIRED_GRACE"],
     "Expiring":["EXPIRING_SOON"],"Parked / dead":["PARKED","DEAD_SITE"]};
-  $("chips").innerHTML = Object.keys(GROUPS).map(g => `<button type="button" class="chip" aria-pressed="false" data-g="${g}">${g}</button>`).join("");
+  const DEFAULT_ON = ["Available", "Dropping", "Expiring"];
+  $("chips").innerHTML = Object.keys(GROUPS).map(g => `<button type="button" class="chip" aria-pressed="${DEFAULT_ON.includes(g)}" data-g="${g}">${g}</button>`).join("");
+  DEFAULT_ON.forEach(g => GROUPS[g].forEach(s => status.add(s)));
   function render() {
     const q = $("q").value.trim().toLowerCase();
     const tl = $("tld").value.toLowerCase().split(",").map(s => s.trim().replace(/^\./, "")).filter(Boolean);

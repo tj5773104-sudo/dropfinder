@@ -614,23 +614,42 @@ def dns_status(domain, resolver):
 
 
 def site_state(domain, session, public_only=False):
-    """Visit the homepage: 'live', 'parked' (for-sale / expired / parking page), 'moved' or 'dead'."""
-    ok = public_url if public_only else None
+    """Visit the homepage: 'live', 'parked' (for-sale / expired / parking page), 'moved' or 'dead'.
+    Any HTTP answer (even 403/503 from bot protection) counts as alive; only no answer at all is 'dead'.
+    Sites in the Tranco ranking are treated as live without a visit."""
+    if AUTH.get(domain):
+        return "live"
     for scheme in ("https", "http"):
+        url = f"{scheme}://{domain}/"
         try:
-            res = fetch(f"{scheme}://{domain}/", session, timeout=8, max_bytes=300_000, url_ok=ok, kinds=None)
+            for _ in range(6):
+                if public_only and not public_url(url):
+                    return "live"  # cannot inspect safely; never claim dead
+                r = session.get(url, timeout=8, stream=True, allow_redirects=False)
+                if r.is_redirect:
+                    nxt = urljoin(url, r.headers.get("location", ""))
+                    r.close()
+                    if urlparse(nxt).scheme not in ("http", "https"):
+                        return "live"
+                    url = nxt
+                    continue
+                break
+            else:
+                return "live"
+            try:
+                body = r.raw.read(300_000, decode_content=True).decode(r.encoding or "utf-8", errors="replace")
+            except Exception:  # noqa: BLE001
+                body = ""
+            finally:
+                r.close()
         except requests.RequestException:
             continue
-        if not res:
-            continue
-        text, _, final = res
-        final_dom = registrable(urlparse(final).hostname or "")
-        if PARK_RE.search(text[:300_000]) or (final_dom and PARK_RE.search(final_dom)):
+        final_dom = registrable(urlparse(url).hostname or "")
+        if (r.status_code < 400 and PARK_RE.search(body)) or (final_dom and final_dom != domain
+                                                              and PARK_RE.search(final_dom)):
             return "parked"
         if final_dom and final_dom != domain:
             return "moved"
-        if len(text.strip()) < 200:
-            return "parked"
         return "live"
     return "dead"
 
@@ -733,7 +752,7 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
     records = []
     seeds, ranked_sites = list(seeds), list(ranked_sites)
     lock = threading.Lock()
-    done = [0]
+    done, nlinks = [0], [0]
 
     def one_seed(s):
         recs = crawler.crawl_site(s, old_k=8) if sitemaps else crawler.crawl(s, depth, max_pages)
@@ -746,8 +765,9 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
             recs = []
         with lock:
             done[0] += 1
+            nlinks[0] += len(recs)
             if done[0] % 20 == 0:
-                log(f"  {done[0]}/{len(ranked_sites)} ranked sites crawled, {len(records) + len(recs)} links so far")
+                log(f"  {done[0]}/{len(ranked_sites)} ranked sites crawled, {nlinks[0]} links so far")
         return recs
 
     if seeds:
@@ -851,7 +871,8 @@ def check(records, dofollow_only=False, min_sources=1, tlds=None, resolver_ip=No
     rows = [build_row(rec, by[rec["domain"]], scores[rec["domain"]]) for rec in results.values()
             if include_all or rec["status"] != "REGISTERED"]
     rows.sort(key=lambda r: (PRIORITY.get(r["status"], 9), -r["score"]))
-    enrich(rows, wayback=wayback, wayback_top=wayback_top, verify=verify, opr_key=opr_key, log=log)
+    enrich(rows, wayback=wayback, wayback_top=wayback_top, verify=verify, opr_key=opr_key, log=log,
+           include_registered=include_all)
     return rows
 
 
@@ -881,7 +902,8 @@ def build_row(rec, rs, score):
             "more_sources": " | ".join(s["url"] for s in sources[:5]), "sources": sources}
 
 
-def enrich(rows, wayback=False, wayback_top=100, verify=False, opr_key=None, log=lambda m: None):
+def enrich(rows, wayback=False, wayback_top=100, verify=False, opr_key=None, log=lambda m: None,
+           include_registered=False):
     session = requests.Session()
     session.headers["User-Agent"] = UA
     if wayback and rows:
@@ -899,7 +921,10 @@ def enrich(rows, wayback=False, wayback_top=100, verify=False, opr_key=None, log
                 r.update(info)
                 if info.get("sd_available") == "yes" and r["status"] == "LIKELY_AVAILABLE":
                     r["status"] = "AVAILABLE"
+                elif info.get("sd_available") == "no" and info.get("sd_price"):
+                    r["status"] = "REGISTERED"  # registry says taken
                 time.sleep(0.5)
+        rows[:] = [r for r in rows if r["status"] != "REGISTERED" or include_registered]
     if opr_key and rows:
         log("Fetching Open PageRank...")
         pr = open_pagerank([r["domain"] for r in rows[:1000]], opr_key, session)
