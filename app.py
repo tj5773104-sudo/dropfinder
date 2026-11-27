@@ -196,6 +196,11 @@ def parse_form(f):
 # --------------------------------------------------------------------------- routes
 @app.get("/")
 def index():
+    return Response(TABLE_PAGE, mimetype="text/html")
+
+
+@app.get("/cards")
+def cards():
     return render_template_string(PAGE, view="feed", limits=limits())
 
 
@@ -274,6 +279,181 @@ def job_csv(jid):
 @app.get("/healthz")
 def healthz():
     return "ok"
+
+
+
+# --------------------------------------------------------------------------- simple table (home page)
+GRAPH_VIA = {"stabledomains", "majestic", "commoncrawl"}
+
+
+def real_sources(r):
+    """Only real web pages that link to the domain (not feeds / rank lists / archive placeholders)."""
+    return [s for s in (r.get("sources") or [])
+            if s.get("url") and s.get("via") not in GRAPH_VIA and "web.archive.org/web/2*" not in s["url"]]
+
+
+def table_rows():
+    f = load_feed()
+    with LOCK:
+        cached = FEED.get("table")
+        if cached is not None and FEED.get("table_at") == FEED["at"]:
+            return cached
+    out = []
+    for r in f["rows"]:
+        src = real_sources(r)
+        if not src:
+            continue
+        src.sort(key=lambda s: (s.get("follow") != "dofollow", not s.get("anchor")))
+        d = r["domain"]
+        out.append({
+            "d": d, "tld": d.split(".", 1)[1] if "." in d else "", "st": r.get("status", ""),
+            "q": r.get("quality") or 0, "v": r.get("est_value") or 0,
+            "y": str(r.get("wb_first") or "")[:4], "n": len(src),
+            "df": sum(1 for s in src if s.get("follow") == "dofollow"),
+            "via": src[0].get("via") or "", "found": (r.get("first_seen") or "")[:10],
+            "spam": bool(df.SPAM_RE.search(d.split(".")[0])),
+            "s": [{"u": s["url"], "a": (s.get("anchor") or "")[:120], "f": s.get("follow") or "",
+                   "via": s.get("via") or ""} for s in src[:5]],
+        })
+    with LOCK:
+        FEED.update(table=out, table_at=FEED["at"])
+    return out
+
+
+@app.get("/table.json")
+def table_json():
+    f = load_feed()
+    resp = jsonify(updated=f["updated"], buy=df.buy_url("DOMAIN"), rows=table_rows())
+    resp.headers["Cache-Control"] = "public, max-age=120"
+    return resp
+
+
+TABLE_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DropFinder - expired domains with real backlinks</title>
+<style>
+:root{--b:#d9dee5;--t:#1b2430;--m:#667085;--a:#1f5fd1;--bg:#fff;--alt:#f6f8fb;--g:#137333;--o:#b35c00}
+*{box-sizing:border-box}body{margin:0;font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--t);background:var(--bg)}
+header{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;padding:10px 12px 4px}
+h1{font-size:18px;margin:0}h1 span{color:var(--a)}.sub{color:var(--m);font-size:13px}
+.bar{display:flex;flex-wrap:wrap;gap:6px;padding:6px 12px 8px;border-bottom:1px solid var(--b);position:sticky;top:0;background:var(--bg);z-index:3}
+.bar input,.bar select{font:inherit;padding:6px 8px;border:1px solid var(--b);border-radius:6px;background:#fff;min-height:34px}
+.bar input[type=search]{flex:1 1 180px}.bar label{display:flex;align-items:center;gap:4px;font-size:13px;white-space:nowrap}
+.info{display:flex;justify-content:space-between;gap:8px;padding:6px 12px;color:var(--m);font-size:13px;flex-wrap:wrap}
+.info a{color:var(--a)}
+.wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{border-collapse:collapse;width:100%;min-width:700px}
+td.src{max-width:330px}.stc{white-space:nowrap}.stc a.buy{display:block;margin-top:4px;text-align:center}
+@media(max-width:900px){.opt{display:none}th,td{padding:6px 6px}td.src{max-width:250px}td.dom{max-width:150px;overflow:hidden;text-overflow:ellipsis}}
+th,td{padding:6px 8px;border-bottom:1px solid var(--b);text-align:left;vertical-align:top}
+th{background:#eef2f7;font-size:12px;text-transform:uppercase;letter-spacing:.02em;color:#3b4656;cursor:pointer;user-select:none;white-space:nowrap;position:sticky;top:0}
+th.ns{cursor:default}th[data-k].on::after{content:" \25BE"}th[data-k].on.asc::after{content:" \25B4"}
+tbody tr:nth-child(even){background:var(--alt)}
+td.dom{font-weight:600;white-space:nowrap;position:sticky;left:0;background:inherit;z-index:1}
+tbody tr td.dom{background:var(--bg)}tbody tr:nth-child(even) td.dom{background:var(--alt)}
+td.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.src a{color:var(--a);text-decoration:none;word-break:break-all}.src a:hover{text-decoration:underline}
+.anc{color:var(--m);font-size:12px;display:block}.more{border:0;background:none;color:var(--a);padding:0;font:inherit;font-size:12px;cursor:pointer}
+.tag{display:inline-block;font-size:11px;padding:1px 6px;border-radius:9px;background:#eef2f7;color:#3b4656;white-space:nowrap}
+.df{background:#e6f4ea;color:var(--g)}.nf{background:#f3f4f6;color:var(--m)}
+.s-AVAILABLE,.s-LIKELY_AVAILABLE{color:var(--g);font-weight:600}.s-PENDING_DELETE,.s-REDEMPTION,.s-EXPIRED_GRACE,.s-EXPIRING_SOON{color:var(--o);font-weight:600}
+.s-DEAD_SITE,.s-PARKED{color:var(--m)}
+a.buy{display:inline-block;padding:4px 10px;border-radius:6px;background:var(--a);color:#fff;text-decoration:none;font-size:13px;white-space:nowrap}
+.pg{display:flex;gap:6px;justify-content:center;align-items:center;padding:12px}
+.pg button{font:inherit;padding:6px 12px;border:1px solid var(--b);border-radius:6px;background:#fff}
+.empty{padding:30px;text-align:center;color:var(--m)}
+footer{color:var(--m);font-size:12px;padding:8px 12px 20px}
+</style></head><body>
+<header><h1>Drop<span>Finder</span></h1><span class="sub">Expired &amp; available domains that real web pages still link to. Updated automatically.</span></header>
+<div class="bar">
+  <input type="search" id="q" placeholder="Search domain, linking page or anchor">
+  <select id="st">
+    <option value="buy">Can register now</option><option value="drop">Dropping soon</option>
+    <option value="all">All statuses</option><option value="dead">Dead site (still registered)</option>
+  </select>
+  <select id="via"><option value="">All sources</option></select>
+  <select id="tld"><option value="">All TLDs</option></select>
+  <label><input type="checkbox" id="dfo"> Dofollow only</label>
+  <label><input type="checkbox" id="nospam" checked> Hide spam</label>
+</div>
+<div class="info"><span id="count">Loading...</span><span><span id="upd"></span> &middot; <a href="/feed.csv">CSV</a></span></div>
+<div class="wrap"><table>
+<thead><tr>
+  <th data-k="d">Domain</th><th class="ns">Linked from &ndash; tap to see the link</th><th data-k="n">Links</th>
+  <th data-k="y">Since</th><th data-k="q">Quality</th><th data-k="v">Value</th>
+  <th data-k="st">Status</th><th data-k="found" class="opt">Found</th>
+</tr></thead><tbody id="rows"></tbody></table></div>
+<div class="pg"><button id="prev">&lsaquo; Prev</button><span id="pno"></span><button id="next">Next &rsaquo;</button></div>
+<footer>Est. value is a rough guide from link and history signals, not an appraisal. Quality (0-100) weighs real-site history, dofollow links and the linking site's authority. Always check a domain's history before buying.</footer>
+<script>
+const VIA={wikipedia:"Wikipedia",cordis:"EU research projects",wikidata:"Closed organisations",crawl:"Top websites",
+  hackernews:"Hacker News",debian:"Debian packages",publishers:"News & gov archives",github:"GitHub",seed:"Your seeds"};
+const ST={AVAILABLE:"Available",LIKELY_AVAILABLE:"Likely free",PENDING_DELETE:"Pending delete",REDEMPTION:"Redemption",
+  EXPIRED_GRACE:"Expired (grace)",EXPIRING_SOON:"Expiring",DEAD_SITE:"Dead site",PARKED:"Parked"};
+const GROUP={buy:["AVAILABLE","LIKELY_AVAILABLE"],drop:["PENDING_DELETE","REDEMPTION","EXPIRED_GRACE","EXPIRING_SOON"],
+  dead:["DEAD_SITE","PARKED"]};
+const SO={AVAILABLE:0,LIKELY_AVAILABLE:1,PENDING_DELETE:2,REDEMPTION:3,EXPIRED_GRACE:4,EXPIRING_SOON:5,DEAD_SITE:6,PARKED:7};
+const PER=100; let BUY="", ALL=[], VIEW=[], page=0, sortK="q", asc=false;
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const safe=u=>/^https?:\/\//i.test(u||"");
+const host=u=>{try{return new URL(u).hostname.replace(/^www\./,"")}catch(e){return u}};
+const frag=t=>encodeURIComponent(t).replace(/-/g,"%2D").replace(/,/g,"%2C");
+function jump(s){const b=s.u.split("#")[0];let t=(s.a||"").replace(/\s+/g," ").trim();
+  if(t.length>70)t=t.slice(0,70).replace(/\s+\S*$/,"");
+  return t.length>=3&&!/^https?:/i.test(t)&&s.via!=="wikipedia"?b+"#:~:text="+frag(t):b;}
+function srcHtml(s){if(!safe(s.u))return"";const p=s.u.replace(/^https?:\/\/(www\.)?/,"");
+  return `<div><a href="${esc(jump(s))}" target="_blank" rel="noopener nofollow">${esc(p.length>70?p.slice(0,70)+"…":p)}</a>
+  <span class="tag ${s.f==="dofollow"?"df":"nf"}">${s.f==="dofollow"?"dofollow":s.f||"link"}</span>
+  ${s.a?`<span class="anc">“${esc(s.a)}”</span>`:""}</div>`;}
+function row(r,i){const extra=r.s.length-1;
+  return `<tr><td class="dom">${esc(r.d)}</td>
+  <td class="src">${srcHtml(r.s[0])}${extra>0?`<div class="x" hidden>${r.s.slice(1).map(srcHtml).join("")}</div>
+   <button class="more" data-i="${i}">+${extra} more page${extra>1?"s":""}</button>`:""}
+   <span class="anc">${esc(VIA[r.via]||r.via)}</span></td>
+  <td class="num">${r.n}</td>
+  <td class="num">${r.y||"-"}</td><td class="num">${r.q}</td>
+  <td class="num">${r.v?"$"+Number(r.v).toLocaleString():"-"}</td>
+  <td class="stc"><span class="s-${r.st}">${ST[r.st]||r.st}</span>${["AVAILABLE","LIKELY_AVAILABLE"].includes(r.st)&&BUY?`<a class="buy" href="${esc(BUY.replace("DOMAIN",encodeURIComponent(r.d)))}" target="_blank" rel="noopener">Register</a>`:""}</td>
+  <td class="num opt">${r.found}</td></tr>`;}
+function apply(){const q=$("q").value.trim().toLowerCase(),g=$("st").value,via=$("via").value,tld=$("tld").value,
+  dfo=$("dfo").checked,ns=$("nospam").checked;
+  VIEW=ALL.filter(r=>(g==="all"||GROUP[g].includes(r.st))&&(!via||r.s.some(s=>s.via===via))&&(!tld||r.tld===tld)
+    &&(!dfo||r.df>0)&&(!ns||!r.spam)
+    &&(!q||r.d.includes(q)||r.s.some(s=>s.u.toLowerCase().includes(q)||s.a.toLowerCase().includes(q))));
+  const k=sortK,m=asc?1:-1;
+  VIEW.sort((a,b)=>{let x=a[k],y=b[k];if(k==="y"){const z=asc?"9999":"0000";x=x||z;y=y||z}
+    if(k==="st"){x=SO[x]??9;y=SO[y]??9}
+    return (x<y?-1:x>y?1:0)*m||b.q-a.q});
+  page=0;render();save();}
+function render(){const n=VIEW.length,pages=Math.max(1,Math.ceil(n/PER));page=Math.min(page,pages-1);
+  const slice=VIEW.slice(page*PER,page*PER+PER);
+  $("rows").innerHTML=slice.length?slice.map((r,i)=>row(r,page*PER+i)).join(""):
+    `<tr><td colspan="8" class="empty">No domains match these filters.</td></tr>`;
+  $("count").textContent=`${n.toLocaleString()} domains (of ${ALL.length.toLocaleString()})`;
+  $("pno").textContent=`Page ${page+1} of ${pages}`;$("prev").disabled=page===0;$("next").disabled=page>=pages-1;
+  document.querySelectorAll("th[data-k]").forEach(th=>{th.classList.toggle("on",th.dataset.k===sortK);th.classList.toggle("asc",th.dataset.k===sortK&&asc)});}
+function save(){try{localStorage.setItem("df-t",JSON.stringify({st:$("st").value,via:$("via").value,tld:$("tld").value,
+  dfo:$("dfo").checked,ns:$("nospam").checked,k:sortK,asc}))}catch(e){}}
+function restore(){try{const o=JSON.parse(localStorage.getItem("df-t")||"{}");if(o.st)$("st").value=o.st;
+  if(o.via)$("via").value=o.via;if(o.tld)$("tld").value=o.tld;$("dfo").checked=!!o.dfo;if(o.ns===false)$("nospam").checked=false;
+  if(o.k){sortK=o.k;asc=!!o.asc}}catch(e){}}
+function fill(sel,counts,label){Object.entries(counts).sort((a,b)=>b[1]-a[1]).forEach(([k,c])=>{
+  const o=document.createElement("option");o.value=k;o.textContent=`${label(k)} (${c})`;$(sel).appendChild(o)});}
+document.querySelector("thead").addEventListener("click",e=>{const th=e.target.closest("th[data-k]");if(!th)return;
+  const k=th.dataset.k;if(sortK===k)asc=!asc;else{sortK=k;asc=(k==="d"||k==="y")}apply();});
+$("rows").addEventListener("click",e=>{const b=e.target.closest(".more");if(!b)return;const x=b.previousElementSibling;
+  x.hidden=!x.hidden;b.textContent=x.hidden?b.dataset.t:"Show less";});
+document.addEventListener("click",e=>{const b=e.target.closest(".more");if(b&&!b.dataset.t)b.dataset.t=b.textContent},true);
+["q","st","via","tld","dfo","nospam"].forEach(id=>$(id).addEventListener(id==="q"?"input":"change",apply));
+$("prev").onclick=()=>{page--;render();scrollTo(0,0)};$("next").onclick=()=>{page++;render();scrollTo(0,0)};
+fetch("/table.json").then(r=>r.json()).then(j=>{ALL=j.rows||[];BUY=j.buy||"";
+  const v={},t={};ALL.forEach(r=>{new Set(r.s.map(s=>s.via)).forEach(x=>{if(x)v[x]=(v[x]||0)+1});t[r.tld]=(t[r.tld]||0)+1});
+  fill("via",v,k=>VIA[k]||k);fill("tld",t,k=>"."+k);restore();
+  if(j.updated)$("upd").textContent="Updated "+new Date(j.updated).toLocaleString([], {dateStyle:"medium",timeStyle:"short"});
+  apply();}).catch(()=>{$("count").textContent="Couldn't load the data - please refresh."});
+</script></body></html>"""
 
 
 def limits():

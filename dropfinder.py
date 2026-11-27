@@ -1762,7 +1762,7 @@ def graph_scan(pairs, info, log, label):
 def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_minutes=40, sites=100,
          wiki_months=2, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=6000,
          seed=None, hn_months=4, debian_sample=1500, cordis_sample=1500, cc_ranks=True,
-         sd_pages=40, majestic_batch=15000, cc_batch=15000, wayback_checks=150, wikidata_types=8,
+         sd_pages=0, majestic_batch=0, cc_batch=0, wayback_checks=150, wikidata_types=8,
          publisher_sites=8, log=print):
     """Fully automatic run.
     Authority-first: StableDomains quality drop feed, a rotating batch of the Majestic Million and of the
@@ -2108,9 +2108,9 @@ def main():
     k.add_argument("--debian", type=int, default=1500, help="random Debian package homepages")
     k.add_argument("--cordis", type=int, default=1500, help="random EU research project websites")
     k.add_argument("--no-cc-ranks", action="store_true", help="skip the Common Crawl authority lookup")
-    k.add_argument("--sd-pages", type=int, default=40, help="pages (25 rows) of the StableDomains quality feed")
-    k.add_argument("--majestic", type=int, default=15000, help="Majestic Million domains to DNS-scan per run")
-    k.add_argument("--cc-batch", type=int, default=15000, help="top Common Crawl domains to DNS-scan per run")
+    k.add_argument("--sd-pages", type=int, default=0, help="pages (25 rows) of the StableDomains quality feed")
+    k.add_argument("--majestic", type=int, default=0, help="Majestic Million domains to DNS-scan per run")
+    k.add_argument("--cc-batch", type=int, default=0, help="top Common Crawl domains to DNS-scan per run")
     k.add_argument("--wayback-checks", type=int, default=150, help="candidates to verify in the Wayback Machine")
     k.add_argument("--wikidata-types", type=int, default=8, help="random kinds of defunct organisations to read")
     k.add_argument("--publishers", type=int, default=8, help="top publisher / gov sites whose old pages to read")
