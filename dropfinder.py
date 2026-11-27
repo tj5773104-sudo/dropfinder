@@ -71,6 +71,8 @@ IGNORE_TARGETS = {"google.com", "googleapis.com", "gstatic.com", "googleusercont
                   "wp.com", "addtoany.com", "sharethis.com", "feedburner.com", "creativecommons.org"}
 # Zones the public can't register in (government, education, military...).
 RESTRICTED_RE = re.compile(r"\.(gov|edu|mil|ac|nhs|police|sch|k12|gob|gouv|govt|int|gc|fed|nic)(\.[a-z]{2,3})?$"
+                           r"|^www\.|\.(youtube|google|goog|apple|amazon|microsoft|windows|android|chrome|gmail|yahoo|bbc|bmw|audi|"
+                           r"lexus|toyota|nike|hsbc|barclays|sky|bing|xbox|office|play|search)$"
                            r"|\.(mod|parliament)\.uk$|\.(state|k12|ci|co|cc|lib|tec|dst)\.[a-z]{2}\.us$|^(gc|fed)\.(ca|us)$",
                            re.I)
 RESOURCE_RE = re.compile(r"(link|resource|blogroll|partner|directory|friends|useful|recommended|sites|websites|"
@@ -91,6 +93,14 @@ def registrable(host):
 
 def now_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def value_ratio(r):
+    """Estimated value / registration price. Only for names you can buy now or soon: a registered name that is
+    merely 'expiring soon' almost always renews (esp. short or valuable ones), so it gets no ratio."""
+    if r.get("status") in ("EXPIRING_SOON", "TAKEN", "REGISTERED"):
+        return 0.0
+    return round((r.get("est_value") or 0) / max(r.get("reg_price") or 1, 1), 1)
 
 
 def buy_url(domain):
@@ -972,22 +982,54 @@ AUTHORITY_SITES = [
 ]
 
 
-def wayback_old_urls(prefix, years, limit=40, session=None, rng=random):
-    """Old article URLs under a prefix, from the Wayback Machine index (the live pages usually still exist)."""
+def _cdx_rows(j):
+    return [x for x in (j or []) if isinstance(x, list) and x and x[0] != "timestamp"]
+
+
+def wayback_old_urls(prefix, years, limit=40, session=None, rng=random, log=lambda m: None):
+    """Old article URLs under a prefix, from the Wayback Machine index (the live pages usually still exist).
+    Uses the CDX *paged* index: a filtered/collapsed prefix query over a huge site (bbc, wired...) times out,
+    but reading one random index block is quick. Filtering is done here instead."""
     s = session or requests.Session()
     s.headers["User-Agent"] = UA
-    y = rng.randint(years[0], years[1])
+    base = "https://web.archive.org/cdx/search/cdx"
+    lo, hi = years
+    rows = []
     try:
-        r = s.get("https://web.archive.org/cdx/search/cdx", timeout=60, params={
-            "url": prefix, "matchType": "prefix", "from": str(y), "to": str(y), "output": "json",
-            "fl": "original", "filter": ["statuscode:200", "mimetype:text/html"], "collapse": "urlkey",
-            "limit": "2000"})
-        rows = [x[0] for x in r.json()[1:]]
-    except (requests.RequestException, ValueError, IndexError):
-        return []
-    rows = [u for u in rows if not SKIP_EXT.search(u) and "?" not in u]
-    rng.shuffle(rows)
-    return rows[:limit]
+        n = int((s.get(base, timeout=25, params={"url": prefix, "matchType": "prefix", "showNumPages": "true"})
+                 .text or "0").strip() or 0)
+        for p in rng.sample(range(n), min(2, n)) if n > 0 else []:
+            j = s.get(base, timeout=40, params={"url": prefix, "matchType": "prefix", "page": str(p), "output": "json",
+                                                "fl": "timestamp,original,statuscode,mimetype"}).json()
+            rows += _cdx_rows(j)
+    except (requests.RequestException, ValueError, TypeError) as e:
+        log(f"    CDX paged index failed for {prefix}: {type(e).__name__}")
+    if not rows:  # fallback: a small, unfiltered, unsorted query is still fast
+        try:
+            y = rng.randint(lo, hi)
+            j = s.get(base, timeout=30, params={"url": prefix, "matchType": "prefix", "from": str(y), "to": str(y),
+                                                "output": "json", "fl": "timestamp,original,statuscode,mimetype",
+                                                "limit": "400"}).json()
+            rows = _cdx_rows(j)
+        except (requests.RequestException, ValueError, TypeError) as e:
+            log(f"    CDX query failed for {prefix}: {type(e).__name__}")
+            return []
+    seen, inyr, other = set(), [], []
+    for x in rows:
+        if len(x) < 4:
+            continue
+        ts, url, code, mime = x[0], x[1], x[2], x[3]
+        if code != "200" or "html" not in (mime or "") or SKIP_EXT.search(url) or "?" in url:
+            continue
+        key = url.split("://")[-1].lower().rstrip("/")
+        if key in seen:
+            continue
+        seen.add(key)
+        yr = int(ts[:4]) if ts[:4].isdigit() else 0
+        (inyr if lo <= yr <= hi else other if yr and yr <= hi + 4 else []).append(url)
+    rng.shuffle(inyr)
+    rng.shuffle(other)
+    return (inyr + other)[:limit]
 
 
 def authority_old_pages(sites=8, per_site=40, crawler=None, rng=random, log=lambda m: None):
@@ -997,7 +1039,7 @@ def authority_old_pages(sites=8, per_site=40, crawler=None, rng=random, log=lamb
     out = []
     sess = requests.Session()
     for prefix, years in picks:
-        urls = wayback_old_urls(prefix, years, per_site, sess, rng)
+        urls = wayback_old_urls(prefix, years, per_site, sess, rng, log)
         n0 = len(out)
         for u in urls:
             if not u.startswith("http"):
@@ -1856,7 +1898,7 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     for r in old.values():
         r["est_value"] = estimate_value(r)
         r["reg_price"] = reg_price(r)
-        r["value_ratio"] = round(r["est_value"] / max(r["reg_price"], 1), 1)
+        r["value_ratio"] = value_ratio(r)
         r["wiki_only"] = wiki_only(r)
         if r.get("via") == "stabledomains" and r.get("quality") is not None and "real_years" not in r:
             continue  # StableDomains already scored it

@@ -75,7 +75,7 @@ def load_feed():
         if r.get("est_value") is None:
             r["est_value"] = df.estimate_value(r)
             r["reg_price"] = df.reg_price(r)
-            r["value_ratio"] = round(r["est_value"] / max(r["reg_price"], 1), 1)
+        r["value_ratio"] = df.value_ratio(r)
         r["wiki_only"] = df.wiki_only(r)
         auth = r.get("opr") if r.get("opr") is not None else r.get("cc_authority")
         r["authority"] = auth if auth not in ("", None) else None
