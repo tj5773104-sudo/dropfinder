@@ -78,7 +78,15 @@ RESTRICTED_RE = re.compile(r"\.(gov|edu|mil|ac|nhs|police|sch|k12|gob|gouv|govt|
 RESOURCE_RE = re.compile(r"(link|resource|blogroll|partner|directory|friends|useful|recommended|sites|websites|"
                          r"tools|references|bookmarks|further-reading|webliography|sponsor)", re.I)
 SPAM_RE = re.compile(r"(casino|poker|slot|bet(ting)?|gambl|viagra|cialis|pharma|pills|porn|sex|xxx|escort|adult|"
-                     r"payday|loan|replica|cbd|vape|crypto|forex|dating|hookup|weight-?loss|keto)", re.I)
+                     r"payday|loan|replica|cbd|vape|crypto|forex|dating|hookup|weight-?loss|keto|pokie|pinco|1win|mostbet|vavada|"
+                     r"pharmacy|apotheke|meds|drugstore|ivermectin|stromectol|gabapentin|neurontin|cymbalta|imitrex|"
+                     r"trazodone|levitra|cilis|amitriptyline|cilostazol|mestinon|pyridostigmine|mebeverine|carbamazepine|"
+                     r"piroxicam|baclofen|celecoxib|diclofenac|sumatriptan|tadalafil|sildenafil|kamagra|propecia|"
+                     r"finasteride|tramadol|xanax|valium|ambien|modafinil|phentermine|clomid|accutane|isotretinoin|"
+                     r"doxycycline|amoxicillin|azithromycin|zithromax|prednisone|lasix|furosemide|plaquenil|"
+                     r"hydroxychloroquine|lisinopril|metformin|zoloft|prozac|lexapro|synthroid|nolvadex|tamoxifen|"
+                     r"valtrex|ventolin|cytotec|misoprostol|priligy|dapoxetine|vardenafil|avanafil)"
+                     r"|^[a-z]{5,}\d+[a-z]\d+$|^[a-z]+\d+info$|info\d+$", re.I)
 PARK_RE = re.compile(r"(domain (name )?(is|may be) for sale|buy this domain|this domain (name )?(has expired|is parked|"
                      r"may be for sale)|domain has expired|parked (free|domain|by)|sedoparking|parkingcrew|bodis|"
                      r"afternic|dan\.com|hugedomains|domainmarket|undeveloped|godaddy\.com/forsale|"
@@ -98,7 +106,7 @@ def now_iso():
 def value_ratio(r):
     """Estimated value / registration price. Only for names you can buy now or soon: a registered name that is
     merely 'expiring soon' almost always renews (esp. short or valuable ones), so it gets no ratio."""
-    if r.get("status") in ("EXPIRING_SOON", "TAKEN", "REGISTERED"):
+    if r.get("status") in ("EXPIRING_SOON", "TAKEN", "REGISTERED") or SPAM_RE.search(r.get("domain", "").split(".")[0]):
         return 0.0
     return round((r.get("est_value") or 0) / max(r.get("reg_price") or 1, 1), 1)
 
@@ -728,13 +736,20 @@ def majestic_million(session=None, log=lambda m: None):
     return out
 
 
-def dns_sweep(domains, workers=60, log=lambda m: None):
-    """Fast parallel NS lookup; returns the domains that do NOT resolve (nxdomain / no NS / errors)."""
+def dns_sweep(domains, workers=60, log=lambda m: None, max_seconds=900):
+    """Fast parallel NS lookup; returns the domains that do NOT resolve (nxdomain / no NS / errors).
+    Public resolvers sometimes throttle the CI runner (10k lookups took 16 min instead of 3), so the sweep has a
+    wall-clock cap: anything not reached in time is simply left for a later run."""
     resolvers = [make_resolver(ns) for ns in ("1.1.1.1", "8.8.8.8", "9.9.9.9")]
-    done, lock = [0], threading.Lock()
+    done, lock, skipped = [0], threading.Lock(), [0]
+    deadline = time.time() + max_seconds
 
     def one(i_d):
         i, d = i_d
+        if time.time() > deadline:
+            with lock:
+                skipped[0] += 1
+            return d, "has_ns"
         st = dns_status(d, resolvers[i % 3])
         for k in (1, 2):  # retry on the other resolvers before trusting an error
             if st != "dns_error":
@@ -749,6 +764,8 @@ def dns_sweep(domains, workers=60, log=lambda m: None):
 
     with ThreadPoolExecutor(workers) as ex:
         res = list(ex.map(one, enumerate(domains)))
+    if skipped[0]:
+        log(f"    DNS time cap reached: {skipped[0]:,} domains left for a later run")
     return {d: st for d, st in res if st != "has_ns"}
 
 
@@ -1711,25 +1728,32 @@ def _merge(old, r, stamp):
 
 def graph_scan(pairs, info, log, label):
     """pairs: domains in authority order. DNS sweep -> registry check -> candidate rows."""
-    pairs = [d for d in pairs if d and registrable(d) == d and not RESTRICTED_RE.search(d) and d not in IGNORE_TARGETS]
+    pairs = [d for d in pairs if d and registrable(d) == d and not RESTRICTED_RE.search(d) and d not in IGNORE_TARGETS
+             and not SPAM_RE.search(d.split(".")[0])]  # big link-farm networks inflate Majestic ranks of spam names
     log(f"{label}: DNS sweep of {len(pairs):,} high-authority domains...")
     dead = dns_sweep(pairs, log=log)
     log(f"  {len(dead):,} do not resolve; asking the registries...")
     recs = status_check(list(dead), rdap_all=True, workers=40, log=log) if dead else {}
     cands = {d: r for d, r in recs.items() if r["status"] != "REGISTERED"}
-    avail = [d for d, r in cands.items() if r["status"] in ("AVAILABLE", "LIKELY_AVAILABLE")][:400]
+    avail = [d for d, r in cands.items() if r["status"] in ("AVAILABLE", "LIKELY_AVAILABLE")]
     if avail:
         sess = requests.Session()
         sess.headers["User-Agent"] = UA
         dropped = 0
-        for d in avail:
-            info = stabledomains_check(d, sess)
+        for n, d in enumerate(avail):
+            info = stabledomains_check(d, sess) if n < 400 else {}
             if info.get("sd_available") == "no":
                 cands.pop(d, None)
                 dropped += 1
             elif info.get("sd_available") == "yes":
                 cands[d].update(status="AVAILABLE", sd_available="yes", sd_price=info.get("sd_price", ""))
-            time.sleep(0.3)
+            elif cands[d].get("dns") == "dns_error":
+                cands.pop(d, None)  # a DNS error isn't evidence it's free (e.g. strana.ua); unconfirmed -> drop
+                dropped += 1
+            else:
+                cands[d]["status"] = "LIKELY_AVAILABLE"  # registry said free but StableDomains couldn't confirm
+            if n < 400:
+                time.sleep(0.3)
         log(f"  StableDomains confirmed {len(avail) - dropped} of {len(avail)} 'available' ({dropped} were taken)")
     log(f"  {len(cands)} are available / dropping / expired")
     return cands
@@ -1738,7 +1762,7 @@ def graph_scan(pairs, info, log, label):
 def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_minutes=40, sites=100,
          wiki_months=2, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=6000,
          seed=None, hn_months=4, debian_sample=1500, cordis_sample=1500, cc_ranks=True,
-         sd_pages=40, majestic_batch=25000, cc_batch=25000, wayback_checks=150, wikidata_types=8,
+         sd_pages=40, majestic_batch=15000, cc_batch=15000, wayback_checks=150, wikidata_types=8,
          publisher_sites=8, log=print):
     """Fully automatic run.
     Authority-first: StableDomains quality drop feed, a rotating batch of the Majestic Million and of the
@@ -2085,8 +2109,8 @@ def main():
     k.add_argument("--cordis", type=int, default=1500, help="random EU research project websites")
     k.add_argument("--no-cc-ranks", action="store_true", help="skip the Common Crawl authority lookup")
     k.add_argument("--sd-pages", type=int, default=40, help="pages (25 rows) of the StableDomains quality feed")
-    k.add_argument("--majestic", type=int, default=25000, help="Majestic Million domains to DNS-scan per run")
-    k.add_argument("--cc-batch", type=int, default=25000, help="top Common Crawl domains to DNS-scan per run")
+    k.add_argument("--majestic", type=int, default=15000, help="Majestic Million domains to DNS-scan per run")
+    k.add_argument("--cc-batch", type=int, default=15000, help="top Common Crawl domains to DNS-scan per run")
     k.add_argument("--wayback-checks", type=int, default=150, help="candidates to verify in the Wayback Machine")
     k.add_argument("--wikidata-types", type=int, default=8, help="random kinds of defunct organisations to read")
     k.add_argument("--publishers", type=int, default=8, help="top publisher / gov sites whose old pages to read")
