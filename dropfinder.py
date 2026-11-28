@@ -74,6 +74,8 @@ IGNORE_TARGETS = {"google.com", "googleapis.com", "gstatic.com", "googleusercont
 RESTRICTED_RE = re.compile(r"\.(gov|edu|mil|ac|nhs|police|sch|k12|gob|gouv|govt|int|gc|fed|nic)(\.[a-z]{2,3})?$"
                            r"|^www\.|\.(youtube|google|goog|apple|amazon|microsoft|windows|android|chrome|gmail|yahoo|bbc|bmw|audi|"
                            r"lexus|toyota|nike|hsbc|barclays|sky|bing|xbox|office|play|search)$"
+                           r"|\.(go|re|or|mil|ac|hs|ms|es|kg|sc)\.kr$|\.(go|or|ac|ed|lg|gr)\.jp$|\.go\.[a-z]{2}$"
+                           r"|\.(ab|bc|mb|nb|nl|ns|nt|nu|on|pe|qc|sk|yk)\.ca$"
                            r"|\.(mod|parliament)\.uk$|\.(state|k12|ci|co|cc|lib|tec|dst)\.[a-z]{2}\.us$|^(gc|fed)\.(ca|us)$",
                            re.I)
 RESOURCE_RE = re.compile(r"(link|resource|blogroll|partner|directory|friends|useful|recommended|sites|websites|"
@@ -897,6 +899,7 @@ def graph_rows(candidates, via, info, stamp):
         rows.append({"domain": d, "status": rec["status"], "score": 0.0, "dofollow_sources": 0,
                      "nofollow_only_sources": 0, "edu_gov_sources": 0, "best_source_rank": "",
                      "expiry": rec.get("expiry", ""), "dns": rec.get("dns", ""), "site": "",
+                     "sd_available": rec.get("sd_available", ""), "sd_price": rec.get("sd_price", ""),
                      "flags": ",".join(name_flags(d)), "via": via, "buy_url": buy_url(d), **meta,
                      "sources": [{"url": f"https://web.archive.org/web/2*/{d}", "domain": "archive.org", "follow": "",
                                   "via": via, "rank": None, "anchor": "Wayback history"}],
@@ -2055,6 +2058,7 @@ def _merge(old, r, stamp):
 
 
 _TLD_NS, _TLD_LOCK = {}, threading.Lock()
+LAST_SWEEP_SKIPPED = []
 
 
 def tld_servers(zone, resolver):
@@ -2120,6 +2124,7 @@ def registry_dns_sweep(domains, qps=120, workers=48, max_seconds=900, log=lambda
 
     with ThreadPoolExecutor(workers) as ex:
         res_ = list(ex.map(one, domains))
+    LAST_SWEEP_SKIPPED[:] = [d for d, st in res_ if st == "skip"]
     if skipped[0]:
         log(f"    registry sweep time cap: {skipped[0]:,} left for the next run")
     return {d: st for d, st in res_ if st in ("nxdomain", "unknown")}
@@ -2585,12 +2590,17 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
         cc_web_ranks([], log=log, window=(start, start + cc_batch), window_out=win, window_filter=keep,
                      max_seconds=600, progress=prog)
         info = {d: {"cc_rank": hc, "cc_pr_rank": pr, "cc_authority": cc_authority(hc)} for d, hc, pr in win}
+        LAST_SWEEP_SKIPPED.clear()
         cands = graph_scan([d for d, _, _ in win], info, log, "Web-graph sweep", sweep="registry",
                            max_seconds=sweep_minutes * 60) if win else {}
         for r in graph_rows(cands, "commoncrawl", info, stamp):
             _merge(old, r, stamp)
         by_source["commoncrawl"] = len(cands)
-        if win or prog.get("rows", 0) > start:
+        left = [info[d]["cc_rank"] for d in LAST_SWEEP_SKIPPED if d in info]
+        if left:  # ran out of time: resume from the first domain we didn't get to
+            cursors["cc"] = max(start + 1, min(left) - 1)
+            log(f"  resuming next run from rank {cursors['cc'] + 1:,}")
+        elif win or prog.get("rows", 0) > start:
             cursors["cc"] = start + cc_batch
         elif prog.get("rows", 0) > 0:  # walked past the end of the file: start again from the top
             cursors["cc"] = 0
