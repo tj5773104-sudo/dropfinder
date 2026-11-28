@@ -996,16 +996,18 @@ def wikidata_old_websites(limit=3000, min_sitelinks=6, session=None, rng=random,
     }
     out, seen = [], set()
     for kind, cond in queries.items():
-        off = rng.choice([0, 0, limit, 2 * limit])
-        q = ("SELECT ?item ?itemLabel ?site ?end ?links WHERE { ?item p:P856 ?st . ?st ps:P856 ?site . %s "
+        off = rng.choice([0, limit, 2 * limit, 3 * limit, 4 * limit])
+        q = ("SELECT ?item ?itemLabel ?site ?end ?links WHERE { "
+             "{ SELECT ?item ?site ?end WHERE { ?item p:P856 ?st . ?st ps:P856 ?site . %s } LIMIT %d OFFSET %d } "
              "?item wikibase:sitelinks ?links . FILTER(?links >= %d) "
-             "SERVICE wikibase:label { bd:serviceParam wikibase:language \"en\" } } LIMIT %d OFFSET %d"
-             % (cond, min_sitelinks, limit, off))
+             "OPTIONAL { ?item rdfs:label ?itemLabel . FILTER(LANG(?itemLabel) = \"en\") } }"
+             % (cond, limit * 4, off * 4, min_sitelinks))
         try:
             r = s.get("https://query.wikidata.org/sparql", params={"query": q, "format": "json"}, timeout=90)
             rows = r.json()["results"]["bindings"]
         except (requests.RequestException, ValueError, KeyError) as e:
-            log(f"  Wikidata old websites ({kind}): failed ({type(e).__name__})")
+            log(f"  Wikidata old websites ({kind}): failed ({type(e).__name__}"
+                + (f", HTTP {r.status_code}" if "r" in locals() and hasattr(r, "status_code") else "") + ")")
             continue
         n0 = len(out)
         for b in rows:
@@ -1039,7 +1041,7 @@ def dmoz_links(sample=3000, session=None, rng=random, log=lambda m: None, max_se
     DMOZ category page that listed the site."""
     s = session or requests.Session()
     s.headers["User-Agent"] = UA
-    p = min(1.0, sample * 1.3 / est_total)
+    p = min(1.0, sample * 4.5 / est_total)  # ~75% of listings are World/Regional and get skipped
     t_end = time.time() + max_seconds
     page_re = re.compile(rb'<ExternalPage about="([^"]+)"')
     topic_re = re.compile(rb"<topic>([^<]+)</topic>")
@@ -1114,8 +1116,15 @@ def resource_pages(domains=4, per_domain=30, session=None, rng=random, log=lambd
     for dom in rng.sample(RESOURCE_DOMAINS, min(domains, len(RESOURCE_DOMAINS))):
         got = []
         try:
-            n = int(s.get(api, timeout=40, params={"url": dom, "showNumPages": "true", "output": "json"})
-                    .json().get("pages", 0))
+            n = 0
+            for attempt in range(3):
+                t = s.get(api, timeout=40, params={"url": dom, "showNumPages": "true", "output": "json"}).text or ""
+                m = re.search(r'"pages"\s*:\s*(\d+)', t) or re.fullmatch(r"\s*(\d+)\s*", t)
+                if m:
+                    n = int(m.group(1))
+                    break
+                log(f"    CC index busy for {dom} (try {attempt + 1}): {t[:80]!r}")
+                time.sleep(10 * (attempt + 1))
             for pg in rng.sample(range(n), min(3, n)) if n else []:
                 r = s.get(api, timeout=60, params={"url": dom, "page": str(pg), "output": "json",
                                                    "fl": "url,status,mime"})
@@ -1179,6 +1188,26 @@ def _cdx_rows(j):
     return [x for x in (j or []) if isinstance(x, list) and x and x[0] != "timestamp"]
 
 
+def _cdx_parse(resp):
+    """CDX answers are a JSON array, JSON lines, or space-separated lines depending on mode - accept all three."""
+    try:
+        return _cdx_rows(resp.json())
+    except ValueError:
+        pass
+    rows = []
+    for ln in (resp.text or "").splitlines():
+        ln = ln.strip().rstrip(",")
+        if not ln or ln.startswith("<"):
+            continue
+        try:
+            x = json.loads(ln)
+        except ValueError:
+            x = ln.split(" ")
+        if isinstance(x, list) and len(x) >= 4:
+            rows.append(x)
+    return _cdx_rows(rows)
+
+
 def wayback_old_urls(prefix, years, limit=40, session=None, rng=random, log=lambda m: None):
     """Old article URLs under a prefix, from the Wayback Machine index (the live pages usually still exist).
     Uses the CDX *paged* index: a filtered/collapsed prefix query over a huge site (bbc, wired...) times out,
@@ -1192,18 +1221,16 @@ def wayback_old_urls(prefix, years, limit=40, session=None, rng=random, log=lamb
         n = int((s.get(base, timeout=25, params={"url": prefix, "matchType": "prefix", "showNumPages": "true"})
                  .text or "0").strip() or 0)
         for p in rng.sample(range(n), min(2, n)) if n > 0 else []:
-            j = s.get(base, timeout=40, params={"url": prefix, "matchType": "prefix", "page": str(p), "output": "json",
-                                                "fl": "timestamp,original,statuscode,mimetype"}).json()
-            rows += _cdx_rows(j)
+            rows += _cdx_parse(s.get(base, timeout=40, params={"url": prefix, "matchType": "prefix", "page": str(p),
+                                                             "output": "json", "fl": "timestamp,original,statuscode,mimetype"}))
     except (requests.RequestException, ValueError, TypeError) as e:
         log(f"    CDX paged index failed for {prefix}: {type(e).__name__}")
     if not rows:  # fallback: a small, unfiltered, unsorted query is still fast
         try:
             y = rng.randint(lo, hi)
-            j = s.get(base, timeout=30, params={"url": prefix, "matchType": "prefix", "from": str(y), "to": str(y),
-                                                "output": "json", "fl": "timestamp,original,statuscode,mimetype",
-                                                "limit": "400"}).json()
-            rows = _cdx_rows(j)
+            rows = _cdx_parse(s.get(base, timeout=30, params={"url": prefix, "matchType": "prefix", "from": str(y),
+                                                              "to": str(y), "output": "json", "limit": "400",
+                                                              "fl": "timestamp,original,statuscode,mimetype"}))
         except (requests.RequestException, ValueError, TypeError) as e:
             log(f"    CDX query failed for {prefix}: {type(e).__name__}")
             return []
@@ -1916,13 +1943,14 @@ def load_data(path):
         return {"domains": {}, "runs": []}
 
 
-WATCH_STATES = {"DEAD_SITE", "PARKED", "EXPIRING_SOON", "EXPIRED_GRACE", "REDEMPTION"}
+WATCH_STATES = {"DEAD_SITE", "PARKED", "EXPIRING_SOON", "EXPIRED_GRACE", "REDEMPTION", "PENDING_DELETE"}
+DROP_STATES = {"EXPIRED_GRACE", "REDEMPTION", "PENDING_DELETE", "AVAILABLE", "LIKELY_AVAILABLE"}
 
 
 def note_drop(r, before, stamp):
     """Mark a domain that moved closer to being registrable (e.g. dead site -> pending delete -> available)."""
     after = r.get("status")
-    if before and after and before != after and before not in BUYABLE \
+    if before in WATCH_STATES and after in DROP_STATES and before != after \
             and (after in BUYABLE or PRIORITY.get(after, 99) < PRIORITY.get(before, 99)):
         r["dropped_at"], r["prev_status"] = stamp, before
         return 1
