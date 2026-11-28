@@ -2193,24 +2193,22 @@ def collect_coingecko(out_path, session=None, log=print, max_minutes=60, pause=4
     done_path = out_path.replace(".tsv.gz", "_done.tsv.gz")
     rows = read_list(out_path)
     done = {r[0] for r in read_list(done_path)}
+    # CoinGecko only serves delisted ("inactive") coins on paid plans; CoinPaprika's free API lists them all
+    base = "https://api.coinpaprika.com/v1"
     try:
-        coins = s.get(f"{base}/coins/list", params={"status": "inactive"}, timeout=60).json()
-        if not isinstance(coins, list):
-            raise ValueError(str(coins)[:120])
-    except (requests.RequestException, ValueError) as e:
-        log(f"  CoinGecko inactive list failed: {e}")
+        coins = [c for c in s.get(f"{base}/coins", timeout=60).json() if not c.get("is_active", True)]
+    except (requests.RequestException, ValueError, AttributeError, TypeError) as e:
+        log(f"  CoinPaprika coin list failed: {e}")
         return len(rows)
     todo = [c for c in coins if c.get("id") and c["id"] not in done]
-    log(f"  CoinGecko: {len(coins):,} delisted coins, {len(todo):,} not looked up yet")
+    log(f"  CoinPaprika: {len(coins):,} inactive coins, {len(todo):,} not looked up yet")
     t_end, got = time.time() + max_minutes * 60, 0
     for c in todo:
         if time.time() > t_end:
             break
         cid = c["id"]
         try:
-            r = s.get(f"{base}/coins/{cid}", timeout=30, params={
-                "localization": "false", "tickers": "false", "market_data": "false",
-                "community_data": "false", "developer_data": "false", "sparkline": "false"})
+            r = s.get(f"{base}/coins/{cid}", timeout=30)
             if r.status_code == 429:
                 time.sleep(70)
                 continue
@@ -2219,13 +2217,13 @@ def collect_coingecko(out_path, session=None, log=print, max_minutes=60, pause=4
             time.sleep(pause)
             continue
         done.add(cid)
-        for u in ((j.get("links") or {}).get("homepage") or [])[:2]:
+        for u in ((j.get("links") or {}).get("website") or [])[:2]:
             try:
                 d = registrable(urlparse(u).hostname or "") if u else ""
             except ValueError:
                 d = ""
             if d and d not in CODE_HOSTS and d not in IGNORE_TARGETS and d not in ("medium.com", "t.me", "linktr.ee"):
-                rows.append([d, cid, (c.get("name") or "").replace("\t", " "), (c.get("symbol") or "").upper()])
+                rows.append([d, cid, (c.get("name") or "").replace("\t", " "), (c.get("symbol") or "").upper(), "paprika"])
                 got += 1
         time.sleep(pause)
     seen, uniq = set(), []
@@ -2235,7 +2233,7 @@ def collect_coingecko(out_path, session=None, log=print, max_minutes=60, pause=4
             uniq.append(r)
     _write_list(out_path, ("\t".join(r) for r in uniq))
     _write_list(done_path, sorted(done))
-    log(f"  CoinGecko: +{got} homepages this run, {len(uniq):,} dead-project domains in total -> {out_path}")
+    log(f"  Dead crypto: +{got} homepages this run, {len(uniq):,} dead-project domains in total -> {out_path}")
     return len(uniq)
 
 
@@ -2332,7 +2330,9 @@ def list_sweep_records(cursors, known, log=print, wiki_slice=40000, wp_slice=250
             continue
         name = r[2] if len(r) > 2 else r[1]
         sym = f" ({r[3]})" if len(r) > 3 and r[3] else ""
-        rec = _rec(f"https://www.coingecko.com/en/coins/{r[1]}", "coingecko.com", f"http://{d}/",
+        paprika = len(r) > 4 and r[4] == "paprika"
+        src = f"https://coinpaprika.com/coin/{r[1]}/" if paprika else f"https://www.coingecko.com/en/coins/{r[1]}"
+        rec = _rec(src, "coinpaprika.com" if paprika else "coingecko.com", f"http://{d}/",
                    f"{name}{sym} - delisted crypto project", "crypto", follow="", reason="dead crypto project")
         if rec:
             recs.append(rec)
