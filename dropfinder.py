@@ -2090,6 +2090,189 @@ def registry_dns_sweep(domains, qps=120, workers=48, max_seconds=900, log=lambda
     return {d: st for d, st in res_ if st in ("nxdomain", "unknown")}
 
 
+# ---- big public lists, collected weekly, swept a slice per run ---------------------------------------
+LIST_DIR = "data/lists"
+WIKI_EL_DUMP = "https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-externallinks.sql.gz"
+
+
+def collect_wiki_cited(out_path, min_links=10, url=WIKI_EL_DUMP, log=print):
+    """Count how often every domain is linked from English Wikipedia, from the full externallinks dump.
+    The heavy lifting (GBs of SQL) is done by curl | gzip | grep | awk; Python only folds hosts into domains.
+    Since MediaWiki 1.41 each row stores the host reversed, e.g. 'https://org.wikipedia.en.'."""
+    import subprocess
+    import tempfile
+    script = (
+        "set -o pipefail\n"
+        f"curl -sfL --retry 3 -A '{UA}' '{url}' | gzip -dc"
+        " | LC_ALL=C grep -oE \"https?://[a-z0-9.-]+\\.'\" | cut -d/ -f3"
+        " | LC_ALL=C awk '{c[$0]++} END {for (k in c) if (c[k] >= 2) print c[k] \"\\t\" k}'\n")
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+        f.write(script)
+    log("Counting Wikipedia external links per domain (several GB, takes a while)...")
+    p = subprocess.run(["bash", f.name], capture_output=True, text=True)
+    if p.returncode != 0:
+        log(f"  failed: {p.stderr[-300:]}")
+        return 0
+    counts = defaultdict(int)
+    for ln in p.stdout.splitlines():
+        n, _, key = ln.partition("\t")
+        host = ".".join(reversed(key.strip().rstrip("'").rstrip(".").split(".")))
+        d = registrable(host)
+        if d and n.isdigit():
+            counts[d] += int(n)
+    keep = sorted(((n, d) for d, n in counts.items() if n >= min_links), reverse=True)
+    _write_list(out_path, (f"{d}\t{n}" for n, d in keep))
+    log(f"  {len(counts):,} domains linked; {len(keep):,} linked {min_links}+ times -> {out_path}")
+    return len(keep)
+
+
+def collect_wordpress(out_path, session=None, log=print, max_pages=400):
+    """Author and homepage sites of every WordPress.org theme and plugin, with active-install counts.
+    A theme's 'Theme by X' footer credit sits on every site using it, so a dead author domain can come with
+    thousands of sitewide links."""
+    s = session or requests.Session()
+    s.headers["User-Agent"] = UA
+    best = {}
+
+    def add(url, installs, kind, slug, name):
+        try:
+            d = registrable(urlparse(url).hostname or "")
+        except ValueError:
+            return
+        if not d or d in ("wordpress.org", "wordpress.com", "w.org") or d in CODE_HOSTS or d in IGNORE_TARGETS:
+            return
+        cur = best.get(d)
+        tot = (cur[0] if cur else 0) + (installs or 0)
+        top = cur[1:] if cur and (cur[4] or 0) >= (installs or 0) else (kind, slug, name, installs or 0)
+        best[d] = (tot, *top)
+
+    for kind in ("themes", "plugins"):
+        page, pages = 1, 1
+        while page <= min(pages, max_pages):
+            params = {"action": f"query_{kind}", "request[per_page]": 250 if kind == "plugins" else 100,
+                      "request[page]": page, "request[fields][active_installs]": 1,
+                      "request[fields][extended_author]": 1, "request[fields][homepage]": 1,
+                      "request[fields][description]": 0, "request[fields][sections]": 0,
+                      "request[fields][short_description]": 0, "request[fields][ratings]": 0,
+                      "request[fields][screenshots]": 0, "request[fields][versions]": 0}
+            try:
+                j = s.get(f"https://api.wordpress.org/{kind}/info/1.2/", params=params, timeout=60).json()
+            except (requests.RequestException, ValueError) as e:
+                log(f"  WordPress {kind} page {page}: {type(e).__name__}")
+                page += 1
+                continue
+            pages = int((j.get("info") or {}).get("pages") or pages)
+            for it in j.get(kind) or []:
+                inst, slug, name = it.get("active_installs") or 0, it.get("slug", ""), htmllib.unescape(it.get("name", ""))
+                urls = [it.get("homepage") or ""]
+                a = it.get("author")
+                if isinstance(a, dict):
+                    urls += [v for k, v in a.items() if isinstance(v, str) and k != "profile" and v.startswith("http")]
+                elif isinstance(a, str):
+                    urls += re.findall(r'href="([^"]+)"', a)
+                for u in urls:
+                    if u.startswith("http"):
+                        add(u, inst, kind[:-1], slug, name)
+            if page % 25 == 0:
+                log(f"  WordPress {kind}: page {page}/{pages}, {len(best):,} domains")
+            page += 1
+            time.sleep(0.3)
+    keep = sorted(best.items(), key=lambda kv: -kv[1][0])
+    _write_list(out_path, (f"{d}\t{v[0]}\t{v[1]}\t{v[2]}\t{v[3]}" for d, v in keep))
+    log(f"  WordPress: {len(keep):,} author/homepage domains -> {out_path}")
+    return len(keep)
+
+
+def _write_list(path, lines):
+    import gzip
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        for ln in lines:
+            f.write(ln + "\n")
+
+
+def read_list(path):
+    import gzip
+    if not os.path.exists(path):
+        return []
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        return [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
+
+
+def wiki_pages_linking(domain, session, limit=3):
+    """A few English Wikipedia articles that link to a domain (exturlusage API)."""
+    out = []
+    for proto in ("https", "http"):
+        try:
+            j = session.get("https://en.wikipedia.org/w/api.php", timeout=20, params={
+                "action": "query", "list": "exturlusage", "euquery": f"*.{domain}", "euprotocol": proto,
+                "eunamespace": 0, "eulimit": limit, "euprop": "title|url", "format": "json"}).json()
+            out += [(x["title"], x.get("url", "")) for x in j.get("query", {}).get("exturlusage", [])]
+        except (requests.RequestException, ValueError, KeyError):
+            pass
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def list_sweep_records(cursors, known, log=print, wiki_slice=40000, wp_slice=25000, sweep_seconds=600, lookups=300):
+    """Take the next slice of each big list, keep domains the registry says don't exist, and turn them into
+    normal link records (with a real page that links to them) for the usual status checks."""
+    recs = []
+    sess = requests.Session()
+    sess.headers["User-Agent"] = UA
+
+    def take(name, rows, n):
+        if not rows:
+            log(f"  {name}: list not built yet (run the weekly collect workflow)")
+            return []
+        start = cursors.get(name, 0)
+        if start >= len(rows):
+            start = 0
+        cursors[name] = start + n
+        out = [r for r in rows[start:start + n] if r and r[0] not in known and registrable(r[0]) == r[0]
+               and not RESTRICTED_RE.search(r[0]) and not SPAM_RE.search(r[0].split(".")[0])]
+        log(f"  {name}: entries {start + 1:,}-{start + n:,} of {len(rows):,} ({len(out):,} new to check)")
+        return out
+
+    wiki = take("wikicount", read_list(os.path.join(LIST_DIR, "wiki_cited.tsv.gz")), wiki_slice) if wiki_slice else []
+    wp = take("wordpress", read_list(os.path.join(LIST_DIR, "wordpress.tsv.gz")), wp_slice) if wp_slice else []
+    doms = list(dict.fromkeys([r[0] for r in wiki] + [r[0] for r in wp]))
+    if not doms:
+        return recs
+    swept = registry_dns_sweep(doms, max_seconds=sweep_seconds, log=log)
+    log(f"  {len(swept):,} of {len(doms):,} not delegated at the registry")
+    n_api = 0
+    for r in wiki:
+        d = r[0]
+        if d not in swept:
+            continue
+        n = int(r[1]) if len(r) > 1 and r[1].isdigit() else 0
+        pages = wiki_pages_linking(d, sess) if n_api < lookups else []
+        n_api += 1
+        for title, url in pages or [("", "")]:
+            src = ("https://en.wikipedia.org/wiki/" + quote(title.replace(" ", "_"))) if title else \
+                  f"https://en.wikipedia.org/wiki/Special:LinkSearch/*.{d}"
+            rec = _rec(src, "wikipedia.org", url or f"http://{d}/", f"linked {n:,} times across Wikipedia",
+                       "wikicount", follow="nofollow", reason=f"{n} Wikipedia links")
+            if rec:
+                recs.append(rec)
+    for r in wp:
+        d = r[0]
+        if d not in swept or len(r) < 5:
+            continue
+        inst, kind, slug, name = r[1], r[2], r[3], r[4]
+        src = f"https://wordpress.org/{kind}s/{slug}/"
+        rec = _rec(src, "wordpress.org", f"http://{d}/",
+                   f"{name} ({kind}) - {int(inst or 0):,}+ active installs", "wordpress", follow="",
+                   reason=f"WordPress {kind} author site")
+        if rec:
+            recs.append(rec)
+    log(f"  {len(recs):,} records from Wikipedia link counts and WordPress authors")
+    return recs
+
+
+
 def graph_scan(pairs, info, log, label, sweep="public", max_seconds=900, max_dead=4000):
     """pairs: domains in authority order. DNS sweep -> registry check -> candidate rows."""
     pairs = [d for d in pairs if d and registrable(d) == d and not RESTRICTED_RE.search(d) and d not in IGNORE_TARGETS
@@ -2137,7 +2320,7 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
          wiki_months=2, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=6000,
          seed=None, hn_months=4, debian_sample=1500, cordis_sample=1500, cc_ranks=True,
          sd_pages=0, majestic_batch=0, cc_batch=150000, sweep_minutes=15, wayback_checks=800, wikidata_types=8,
-         publisher_sites=9, wikidata_old=3000, dmoz_sample=3000, resource_domains=4, watch_top=1500, log=print):
+         publisher_sites=9, wikidata_old=3000, dmoz_sample=3000, resource_domains=4, watch_top=1500, wiki_slice=40000, wp_slice=25000, log=print):
     """Fully automatic run.
     Authority-first: StableDomains quality drop feed, a rotating batch of the Majestic Million and of the
     Common Crawl ranking (DNS + registry checks), then link discovery (ranked sites, Hacker News, Debian,
@@ -2260,10 +2443,18 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
                       publisher_sites=publisher_sites, wikidata_old=wikidata_old, dmoz_sample=dmoz_sample,
                       resource_domains=resource_domains, log=log)
     for v in ("crawl", "wikipedia", "hackernews", "debian", "cordis", "wikidata", "publishers", "wikidata_old",
-              "dmoz", "resources", "press"):
+              "dmoz", "resources", "press", "wikicount", "wordpress"):
         by_source[v + "_links"] = sum(1 for r in records if r.get("via") == v)
     log(f"Harvested {len(records)} links ({sum(r['follow'] == 'dofollow' for r in records)} dofollow) "
         f"to {len({r['target_domain'] for r in records})} domains.")
+    if (wiki_slice or wp_slice) and time_left("list sweep"):
+        log("Big lists: Wikipedia link counts and WordPress theme/plugin authors...")
+        try:
+            lrec = list_sweep_records(cursors, set(old), log=log, wiki_slice=wiki_slice, wp_slice=wp_slice)
+        except Exception as e:  # noqa: BLE001
+            log(f"  failed: {type(e).__name__}: {e}")
+            lrec = []
+        records += lrec
     rows = check(records, workers=40, wayback=True, wayback_top=300, verify=True, opr_key=opr_key,
                  site_check_top=1000, max_domains=15000, log=log) if records else []
     for r in rows:
@@ -2536,6 +2727,11 @@ def main():
     k.add_argument("--random-seed", type=int)
     k.set_defaults(fn=cmd_hunt)
 
+    co = sub.add_parser("collect", help="weekly: build the big domain lists (Wikipedia link counts, WordPress authors)")
+    co.add_argument("--out", default=LIST_DIR)
+    co.add_argument("--only", choices=["wiki", "wordpress"], default=None)
+    co.set_defaults(fn=lambda a: [collect_wiki_cited(os.path.join(a.out, "wiki_cited.tsv.gz")) if a.only != "wordpress" else 0,
+                                  collect_wordpress(os.path.join(a.out, "wordpress.tsv.gz")) if a.only != "wiki" else 0])
     sub.add_parser("selftest", help="offline tests").set_defaults(fn=lambda a: selftest())
     args = ap.parse_args()
     args.fn(args)
