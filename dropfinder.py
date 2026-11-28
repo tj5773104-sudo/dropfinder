@@ -785,6 +785,18 @@ def dns_sweep(domains, workers=60, log=lambda m: None, max_seconds=900):
 
 
 WB_REAL_MIN_WORDS = 120
+# Words that show up when an expired domain was re-registered for spam (casino, pharma, adult, loans, cloned
+# shops, SEO link farms) - Latin and CJK variants. A page needs several hits before we call it spam.
+HIST_SPAM_RE = re.compile(
+    r"(\b(online casino|casino|slot gacor|slots?|poker|sportsbook|betting|bet365|judi|togel|bandar|viagra|cialis|"
+    r"levitra|kamagra|online pharmacy|no prescription|payday loans?|replica (watches|handbags)|porn|xxx|escort|"
+    r"camgirls?|essay writing service|buy essays?|cbd oil|forex signals|hentai|hookups?)\b|"
+    r"博彩|娱乐城|澳门|彩票|赌场|六合彩|真人视讯|百家乐|ラブドール|激安|スーパーコピー|コピー品|オンラインカジノ)", re.I)
+
+
+def spam_hits(text):
+    words = [m.group(0).lower() for m in HIST_SPAM_RE.finditer(text[:200_000])]
+    return words
 
 
 def wayback_real_history(domain, session, samples=4):
@@ -803,7 +815,9 @@ def wayback_real_history(domain, session, samples=4):
     years = sorted({int(t[:4]) for t, _ in rows})
     step = max(1, len(rows) // samples)
     picks = rows[::step][:samples]
-    real = 0
+    if rows[-1] not in picks:  # always look at the latest capture: that's where post-expiry spam shows up
+        picks = picks[:max(1, samples - 1)] + [rows[-1]]
+    real, spam = 0, []
     for ts, orig in picks:
         try:
             pr = archive_get(session, f"https://web.archive.org/web/{ts}id_/{orig}", timeout=25, stream=True)
@@ -814,12 +828,19 @@ def wayback_real_history(domain, session, samples=4):
         text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", body)
         text = re.sub(r"<[^>]+>", " ", text)
         words = len(re.findall(r"[A-Za-zÀ-ɏ]{3,}", text))
-        if words >= WB_REAL_MIN_WORDS and not PARK_RE.search(text[:20000]):
+        hits = spam_hits(text)
+        if len(hits) >= 4:
+            spam.append((ts[:4], sorted(set(hits))[:4]))
+        elif words >= WB_REAL_MIN_WORDS and not PARK_RE.search(text[:20000]):
             real += 1
     ratio = real / max(1, len(picks))
     span = years[-1] - years[0] + 1
-    return {"real_ratio": round(ratio, 2), "real_years": round(span * ratio, 1), "wb_first": str(years[0]),
-            "wb_last": str(years[-1]), "wb_years": span, "parked_only": real == 0, "never_archived": False}
+    out = {"real_ratio": round(ratio, 2), "real_years": round(span * ratio, 1), "wb_first": str(years[0]),
+           "wb_last": str(years[-1]), "wb_years": span, "parked_only": real == 0 and not spam, "never_archived": False,
+           "spam_checked": True, "spam_hist": ""}
+    if spam:
+        out["spam_hist"] = f"{spam[0][0]}: " + ", ".join(spam[0][1])
+    return out
 
 
 def quality_score(r):
@@ -860,6 +881,9 @@ def quality_score(r):
     if r.get("never_archived"):
         q -= 15
         reasons.append("never archived")
+    if r.get("spam_hist"):
+        q -= 35
+        reasons.append(f"archive shows spam ({r['spam_hist']})")
     if "digits+hyphens" in flags:
         q -= 10
     return max(0, min(100, round(q))), reasons
@@ -908,6 +932,8 @@ def estimate_value(r):
         m *= 0.1
     if r.get("parked_only"):
         m *= 0.3
+    if r.get("spam_hist"):
+        m *= 0.2
     if r.get("never_archived") or (r.get("real_years") is not None and r.get("real_years") != "" and float(r["real_years"]) == 0):
         m *= 0.15  # links without a real site behind them are usually spam networks
     if re.search(r"\d", sld):
@@ -2013,7 +2039,7 @@ def _merge(old, r, stamp):
         r["via"] = ",".join(sorted(vias))
         for k in ("wb_first", "wb_last", "wb_years", "wb_months", "opr", "ref_domains", "cc_rank", "cc_pr_rank",
                   "cc_authority", "ref_subnets", "real_years", "real_ratio", "parked_only", "never_archived",
-                  "mm_rank", "value_usd"):
+                  "mm_rank", "value_usd", "spam_checked", "spam_hist"):
             if r.get(k) in (None, "") and prev.get(k) not in (None, ""):
                 r[k] = prev[k]
     old[r["domain"]] = r
@@ -2538,10 +2564,12 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
 
     # 6. Wayback real-history check for unverified candidates (best first), then Quality for everything
     live = [r for r in old.values() if r.get("status") not in ("TAKEN", "REGISTERED")]
-    todo = [r for r in live if r.get("via") != "stabledomains" and r.get("real_years") in (None,)
-            and r.get("status") in ("AVAILABLE", "LIKELY_AVAILABLE", "PENDING_DELETE", "REDEMPTION", "EXPIRED_GRACE")]
-    todo.sort(key=lambda r: -((r.get("ref_subnets") or 0) + (r.get("cc_authority") or 0) * 50 + r.get("score", 0) * 20
-                               + len(r.get("sources") or []) * 5))
+    buyish = ("AVAILABLE", "LIKELY_AVAILABLE", "PENDING_DELETE", "REDEMPTION", "EXPIRED_GRACE")
+    todo = [r for r in live if r.get("via") != "stabledomains" and r.get("status") in buyish
+            and (r.get("real_years") in (None,) or (not r.get("spam_checked") and not r.get("never_archived")))]
+    todo.sort(key=lambda r: (r.get("real_years") is not None,  # never-checked first, spam re-checks after
+                             -((r.get("ref_subnets") or 0) + (r.get("cc_authority") or 0) * 50 + r.get("score", 0) * 20
+                               + len(r.get("sources") or []) * 5)))
     todo = todo[:wayback_checks] if time.time() < t0 + budget_minutes * 60 * 0.95 else todo[:30]
     if todo:
         wb_end = max(time.time() + 120, min(time.time() + 30 * 60, t0 + budget_minutes * 60 * 0.8))
