@@ -2223,7 +2223,7 @@ def collect_wordpress(out_path, session=None, log=print, max_pages=400):
     return len(keep)
 
 
-def collect_coingecko(out_path, session=None, log=print, max_minutes=60, pause=4.0):
+def collect_coingecko(out_path, session=None, log=print, max_minutes=60, pause=6.0):
     """Homepages of delisted ('inactive') crypto projects from CoinGecko's free API. The 2017-2021 token boom
     produced thousands of project sites that collected press, exchange and forum links, then died.
     Detail calls are rate-limited, so this resumes where the previous weekly run stopped."""
@@ -2241,17 +2241,20 @@ def collect_coingecko(out_path, session=None, log=print, max_minutes=60, pause=4
         log(f"  CoinPaprika coin list failed: {e}")
         return len(rows)
     todo = [c for c in coins if c.get("id") and c["id"] not in done]
+    todo.sort(key=lambda c: c.get("type") != "coin")  # own-chain coins (older, real projects) before meme tokens
     log(f"  CoinPaprika: {len(coins):,} inactive coins, {len(todo):,} not looked up yet")
-    t_end, got = time.time() + max_minutes * 60, 0
+    t_end, got, limited = time.time() + max_minutes * 60, 0, 0
     for c in todo:
         if time.time() > t_end:
             break
         cid = c["id"]
         try:
-            r = s.get(f"{base}/coins/{cid}", timeout=30)
-            if r.status_code == 429:
-                time.sleep(70)
-                continue
+            for _ in range(3):
+                r = s.get(f"{base}/coins/{cid}", timeout=30)
+                if r.status_code != 429:
+                    break
+                limited += 1
+                time.sleep(65)
             j = r.json() if r.status_code == 200 else {}
         except (requests.RequestException, ValueError):
             time.sleep(pause)
@@ -2273,6 +2276,7 @@ def collect_coingecko(out_path, session=None, log=print, max_minutes=60, pause=4
             uniq.append(r)
     _write_list(out_path, ("\t".join(r) for r in uniq))
     _write_list(done_path, sorted(done))
+    log(f"  Dead crypto: {len(done):,} coins looked up so far ({limited} rate-limit waits this run)")
     log(f"  Dead crypto: +{got} homepages this run, {len(uniq):,} dead-project domains in total -> {out_path}")
     return len(uniq)
 
