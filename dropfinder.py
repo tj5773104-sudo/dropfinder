@@ -829,7 +829,7 @@ def wayback_real_history(domain, session, samples=4):
         text = re.sub(r"<[^>]+>", " ", text)
         words = len(re.findall(r"[A-Za-zÀ-ɏ]{3,}", text))
         hits = spam_hits(text)
-        if len(hits) >= 4:
+        if len(hits) >= 4 and len(set(hits)) >= 2:  # one word repeated ("slots", "poker") isn't enough
             spam.append((ts[:4], sorted(set(hits))[:4]))
         elif words >= WB_REAL_MIN_WORDS and not PARK_RE.search(text[:20000]):
             real += 1
@@ -1725,7 +1725,7 @@ CSV_COLS = ["domain", "status", "quality", "score", "dofollow_sources", "nofollo
 def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categories=(), wiki_limit=300,
             github_query=None, github_limit=30, public_only=False, sitemaps=False, ranked_sites=(),
             deadline=None, hn_months=0, debian_sample=0, cordis_sample=0, rng=random, wikidata_types=0,
-            publisher_sites=0, wikidata_old=0, dmoz_sample=0, resource_domains=0, log=lambda msg: None):
+            publisher_sites=0, wikidata_old=0, dmoz_sample=0, resource_domains=0, slashdot_years=0, log=lambda msg: None):
     """Collect outbound link records from seeds, ranked sites' old pages, Wikipedia and GitHub."""
     crawler = Crawler(delay=delay, public_only=public_only, deadline=deadline)
     records = []
@@ -1791,6 +1791,15 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
         end = time.time() + minutes * 60
         return Crawler(delay=delay, public_only=public_only, deadline=min(end, deadline) if deadline else end)
 
+    if slashdot_years:
+        log(f"Reading old Slashdot stories from {slashdot_years} random years...")
+        try:
+            recs = slashdot_links(slashdot_years, crawler=own_crawler(10), rng=rng, log=log)
+        except Exception as e:  # noqa: BLE001
+            log(f"  failed: {type(e).__name__}: {e}")
+            recs = []
+        log(f"  {len(recs)} links ({sum(r['follow'] == 'dofollow' for r in recs)} dofollow)")
+        records.extend(recs)
     if resource_domains:
         log(f"Reading 'useful links' / resources pages on {resource_domains} kinds of .gov/.edu/.ac.uk sites...")
         try:
@@ -2263,6 +2272,88 @@ def collect_coingecko(out_path, session=None, log=print, max_minutes=60, pause=4
     return len(uniq)
 
 
+def collect_packages(out_path, session=None, log=print):
+    """Upstream homepages of every Arch Linux package, FreeBSD port and F-Droid app. These directories link
+    projects' homepages with plain (dofollow) links, and old open-source projects' domains lapse all the time."""
+    import bz2
+    s = session or requests.Session()
+    s.headers["User-Agent"] = UA
+    rows, seen = [], set()
+
+    def add(url, src, name, kind):
+        try:
+            d = registrable(urlparse(url or "").hostname or "")
+        except ValueError:
+            return
+        if d and d not in seen and d not in CODE_HOSTS and d not in IGNORE_TARGETS and not RESTRICTED_RE.search(d):
+            seen.add(d)
+            rows.append(f"{d}\t{src}\t{(name or '').replace(chr(9), ' ')[:80]}\t{kind}")
+
+    try:  # Arch Linux: JSON search API, 250 per page
+        page, pages = 1, 1
+        while page <= pages and page <= 200:
+            j = s.get("https://archlinux.org/packages/search/json/", params={"page": page, "limit": 250}, timeout=60).json()
+            pages = int(j.get("num_pages") or 1)
+            for p in j.get("results", []):
+                add(p.get("url"), f"https://archlinux.org/packages/{p.get('repo')}/{p.get('arch')}/{p.get('pkgname')}/",
+                    p.get("pkgname"), "Arch package")
+            page += 1
+            time.sleep(0.5)
+        log(f"  Arch: {len(rows):,} homepage domains")
+    except (requests.RequestException, ValueError) as e:
+        log(f"  Arch failed: {type(e).__name__}")
+    n0 = len(rows)
+    try:  # FreeBSD ports INDEX: name|path|prefix|comment|descr|maintainer|categories|bdeps|rdeps|www|...
+        raw = bz2.decompress(s.get("https://download.freebsd.org/ports/index/INDEX-14.bz2", timeout=120).content)
+        for ln in raw.decode("utf-8", "replace").splitlines():
+            f = ln.split("|")
+            if len(f) > 9 and f[9].startswith("http"):
+                port = f[1].replace("/usr/ports/", "")
+                add(f[9], f"https://www.freshports.org/{port}/", f[0].rsplit("-", 1)[0], "FreeBSD port")
+        log(f"  FreeBSD: {len(rows) - n0:,} more")
+    except (requests.RequestException, OSError, ValueError) as e:
+        log(f"  FreeBSD failed: {type(e).__name__}")
+    n0 = len(rows)
+    try:  # F-Droid repo index
+        j = s.get("https://f-droid.org/repo/index-v1.json", timeout=180).json()
+        for a in j.get("apps", []):
+            pkg = a.get("packageName", "")
+            name = a.get("name") or ((a.get("localized") or {}).get("en-US") or {}).get("name") or pkg
+            add(a.get("webSite"), f"https://f-droid.org/en/packages/{pkg}/", name, "F-Droid app")
+        log(f"  F-Droid: {len(rows) - n0:,} more")
+    except (requests.RequestException, ValueError) as e:
+        log(f"  F-Droid failed: {type(e).__name__}")
+    _write_list(out_path, rows)
+    log(f"  packages: {len(rows):,} homepage domains -> {out_path}")
+    return len(rows)
+
+
+def slashdot_links(years=3, per_year=40, crawler=None, rng=random, log=lambda m: None):
+    """Outbound links from old Slashdot stories (1998-2015). Story links are plain dofollow links. robots.txt
+    blocks the daily issue pages, so stories are picked from the yearly archive (allowed) and fetched one by one."""
+    crawler = crawler or Crawler(delay=1.5)
+    out = []
+    for y in rng.sample(range(1998, 2016), years):
+        res = crawler.get(f"https://slashdot.org/archive.pl?op=bytime&keyword=&year={y}")
+        if not res:
+            log(f"  Slashdot {y}: archive not reachable")
+            continue
+        stories = sorted(set(re.findall(r'href="((?:https?:)?//[a-z]*\.?slashdot\.org/story/\d\d/\d\d/\d\d/\d+[^"#]*)"', res[0])))
+        stories = ["https:" + u if u.startswith("//") else u for u in stories]
+        picks = rng.sample(stories, min(per_year, len(stories)))
+        n0 = len(out)
+        for u in picks:
+            r2 = crawler.get(u)
+            if not r2:
+                continue
+            for rec in extract_links(r2[0], r2[2], r2[1])[0]:
+                if "slashdot" not in rec["target_domain"]:
+                    rec["via"] = "slashdot"
+                    out.append(rec)
+        log(f"  Slashdot {y}: {len(stories)} stories listed, read {len(picks)}, {len(out) - n0} outbound links")
+    return out
+
+
 def _write_list(path, lines):
     import gzip
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -2296,7 +2387,7 @@ def wiki_pages_linking(domain, session, limit=3):
 
 
 def list_sweep_records(cursors, known, log=print, wiki_slice=40000, wp_slice=25000, sweep_seconds=600, lookups=300,
-                       crypto_slice=20000):
+                       crypto_slice=20000, pkg_slice=30000):
     """Take the next slice of each big list, keep domains the registry says don't exist, and turn them into
     normal link records (with a real page that links to them) for the usual status checks."""
     recs = []
@@ -2319,7 +2410,8 @@ def list_sweep_records(cursors, known, log=print, wiki_slice=40000, wp_slice=250
     wiki = take("wikicount", read_list(os.path.join(LIST_DIR, "wiki_cited.tsv.gz")), wiki_slice) if wiki_slice else []
     wp = take("wordpress", read_list(os.path.join(LIST_DIR, "wordpress.tsv.gz")), wp_slice) if wp_slice else []
     crypto = take("crypto", read_list(os.path.join(LIST_DIR, "coingecko.tsv.gz")), crypto_slice) if crypto_slice else []
-    doms = list(dict.fromkeys([r[0] for r in wiki] + [r[0] for r in wp] + [r[0] for r in crypto]))
+    pkgs = take("packages", read_list(os.path.join(LIST_DIR, "packages.tsv.gz")), pkg_slice) if pkg_slice else []
+    doms = list(dict.fromkeys([r[0] for r in wiki] + [r[0] for r in wp] + [r[0] for r in crypto] + [r[0] for r in pkgs]))
     if not doms:
         return recs
     swept = registry_dns_sweep(doms, max_seconds=sweep_seconds, log=log)
@@ -2362,7 +2454,14 @@ def list_sweep_records(cursors, known, log=print, wiki_slice=40000, wp_slice=250
                    f"{name}{sym} - delisted crypto project", "crypto", follow="", reason="dead crypto project")
         if rec:
             recs.append(rec)
-    log(f"  {len(recs):,} records from Wikipedia link counts, WordPress authors and dead crypto projects")
+    for r in pkgs:
+        if r[0] not in swept or len(r) < 4:
+            continue
+        rec = _rec(r[1], urlparse(r[1]).hostname.replace("www.", ""), f"http://{r[0]}/", f"{r[2]} ({r[3]} homepage)",
+                   "packages", follow="dofollow", reason=r[3])
+        if rec:
+            recs.append(rec)
+    log(f"  {len(recs):,} records from Wikipedia link counts, WordPress authors, dead crypto and package homepages")
     return recs
 
 
@@ -2414,7 +2513,7 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
          wiki_months=2, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=6000,
          seed=None, hn_months=4, debian_sample=1500, cordis_sample=1500, cc_ranks=True,
          sd_pages=0, majestic_batch=0, cc_batch=150000, sweep_minutes=15, wayback_checks=800, wikidata_types=8,
-         publisher_sites=9, wikidata_old=3000, dmoz_sample=3000, resource_domains=4, watch_top=1500, wiki_slice=40000, wp_slice=25000, log=print):
+         publisher_sites=9, wikidata_old=3000, dmoz_sample=3000, resource_domains=4, watch_top=1500, wiki_slice=40000, wp_slice=25000, slashdot_years=3, log=print):
     """Fully automatic run.
     Authority-first: StableDomains quality drop feed, a rotating batch of the Majestic Million and of the
     Common Crawl ranking (DNS + registry checks), then link discovery (ranked sites, Hacker News, Debian,
@@ -2535,9 +2634,9 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
                       workers=workers, deadline=deadline, hn_months=hn_months, debian_sample=debian_sample,
                       cordis_sample=cordis_sample, rng=rng, wikidata_types=wikidata_types,
                       publisher_sites=publisher_sites, wikidata_old=wikidata_old, dmoz_sample=dmoz_sample,
-                      resource_domains=resource_domains, log=log)
+                      resource_domains=resource_domains, slashdot_years=slashdot_years, log=log)
     for v in ("crawl", "wikipedia", "hackernews", "debian", "cordis", "wikidata", "publishers", "wikidata_old",
-              "dmoz", "resources", "press", "wikicount", "wordpress", "crypto"):
+              "dmoz", "resources", "press", "wikicount", "wordpress", "crypto", "slashdot", "packages"):
         by_source[v + "_links"] = sum(1 for r in records if r.get("via") == v)
     log(f"Harvested {len(records)} links ({sum(r['follow'] == 'dofollow' for r in records)} dofollow) "
         f"to {len({r['target_domain'] for r in records})} domains.")
@@ -2825,10 +2924,11 @@ def main():
 
     co = sub.add_parser("collect", help="weekly: build the big domain lists (Wikipedia link counts, WordPress authors)")
     co.add_argument("--out", default=LIST_DIR)
-    co.add_argument("--only", choices=["wiki", "wordpress", "coingecko"], default=None)
+    co.add_argument("--only", choices=["wiki", "wordpress", "coingecko", "packages"], default=None)
     co.set_defaults(fn=lambda a: [
         collect_wiki_cited(os.path.join(a.out, "wiki_cited.tsv.gz")) if a.only in (None, "wiki") else 0,
         collect_wordpress(os.path.join(a.out, "wordpress.tsv.gz")) if a.only in (None, "wordpress") else 0,
+        collect_packages(os.path.join(a.out, "packages.tsv.gz")) if a.only in (None, "packages") else 0,
         collect_coingecko(os.path.join(a.out, "coingecko.tsv.gz")) if a.only in (None, "coingecko") else 0])
     sub.add_parser("selftest", help="offline tests").set_defaults(fn=lambda a: selftest())
     args = ap.parse_args()

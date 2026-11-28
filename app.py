@@ -320,6 +320,7 @@ def table_rows():
             "via": src[0].get("via") or "", "found": (r.get("first_seen") or "")[:10],
             "spam": bool(df.SPAM_RE.search(d.split(".")[0])),
             "drop": (r.get("dropped_at") or "")[:10], "was": r.get("prev_status") or "",
+            "sp": r.get("spam_hist") or "", "spc": 1 if r.get("spam_checked") else 0,
             "s": [{"u": s["url"], "a": (s.get("anchor") or "")[:120], "f": s.get("follow") or "",
                    "via": s.get("via") or "", **({"g": 1} if s.get("graph") else {})} for s in src[:5]],
         })
@@ -381,7 +382,9 @@ td.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
 .src a{color:var(--a);text-decoration:none;word-break:break-all}.src a:hover{text-decoration:underline}
 .anc{color:var(--m);font-size:12px;display:block}.more{border:0;background:none;color:var(--a);padding:0;font:inherit;font-size:12px;cursor:pointer}
 .tag{display:inline-block;font-size:11px;padding:1px 6px;border-radius:9px;background:#eef2f7;color:#3b4656;white-space:nowrap}
-.df{background:#e6f4ea;color:var(--g)}.new{display:block;width:max-content;margin-top:3px;background:#fff4e5;color:var(--o)}.nf{background:#f3f4f6;color:var(--m)}
+.df{background:#e6f4ea;color:var(--g)}.warn{display:block;width:max-content;margin-top:3px;background:#fdecea;color:#b42318}
+#pop .spw{background:#fdecea;color:#b42318;border-radius:7px;padding:6px 8px;font-size:12px;margin:-4px 0 10px}
+#pop .spok{color:var(--g);font-size:12px;margin:-6px 0 10px}.new{display:block;width:max-content;margin-top:3px;background:#fff4e5;color:var(--o)}.nf{background:#f3f4f6;color:var(--m)}
 .s-AVAILABLE,.s-LIKELY_AVAILABLE{color:var(--g);font-weight:600}.s-PENDING_DELETE,.s-REDEMPTION,.s-EXPIRED_GRACE,.s-EXPIRING_SOON{color:var(--o);font-weight:600}
 .s-DEAD_SITE,.s-PARKED{color:var(--m)}
 a.buy{display:inline-block;padding:4px 10px;border-radius:6px;background:var(--a);color:#fff;text-decoration:none;font-size:13px;white-space:nowrap}
@@ -421,7 +424,8 @@ td.dom{max-width:230px;overflow:hidden;text-overflow:ellipsis}
   <select id="au"><option value="1">Authority 1+</option><option value="3">Strong only (3+)</option><option value="0">Any authority</option></select>
   <select id="mk"><option value="">All (except hidden)</option><option value="s">&#9733; My shortlist</option><option value="u">Not checked yet</option><option value="c">&#10003; Checked</option><option value="h">Hidden</option></select>
   <label><input type="checkbox" id="dfo"> Dofollow only</label>
-  <label><input type="checkbox" id="nospam" checked> Hide spam</label>
+  <label><input type="checkbox" id="nospam" checked> Hide spam names</label>
+  <label title="Hide domains whose archived pages show casino, pharma, adult or other spam"><input type="checkbox" id="nosph"> Hide spam history</label>
 </div>
 <div class="info"><span><span id="count">Loading...</span> &middot; tap a domain for quick checks</span><span><span id="upd"></span> &middot; <a href="/feed.csv">CSV</a> &middot; <a href="/drops.rss">Drop alerts (RSS)</a></span></div>
 <div class="wrap"><table>
@@ -437,7 +441,7 @@ td.dom{max-width:230px;overflow:hidden;text-overflow:ellipsis}
 <script>
 const VIA={wikipedia:"Wikipedia",cordis:"EU research projects",wikidata:"Closed organisations",crawl:"Top websites",
   hackernews:"Hacker News",debian:"Debian packages",publishers:"News & gov archives",github:"GitHub",seed:"Your seeds",
-  commoncrawl:"Web-graph sweep",wikicount:"Wikipedia link counts",wordpress:"WordPress authors",crypto:"Dead crypto projects",wikidata_old:"Former official sites",dmoz:"DMOZ directory",resources:"Gov/edu links pages",press:"Press releases"};
+  commoncrawl:"Web-graph sweep",wikicount:"Wikipedia link counts",wordpress:"WordPress authors",crypto:"Dead crypto projects",slashdot:"Slashdot stories",packages:"Package homepages",wikidata_old:"Former official sites",dmoz:"DMOZ directory",resources:"Gov/edu links pages",press:"Press releases"};
 const ST={AVAILABLE:"Available",LIKELY_AVAILABLE:"Likely free",PENDING_DELETE:"Pending delete",REDEMPTION:"Redemption",
   EXPIRED_GRACE:"Expired (grace)",EXPIRING_SOON:"Expiring",DEAD_SITE:"Dead site",PARKED:"Parked"};
 const GROUP={buy:["AVAILABLE","LIKELY_AVAILABLE"],drop:["PENDING_DELETE","REDEMPTION","EXPIRED_GRACE","EXPIRING_SOON"],
@@ -469,13 +473,13 @@ function row(r,i){const extra=r.s.length-1,m=mk(r.d);
   <td class="num">${r.n||"web"}</td>
   <td class="num">${r.au?r.au.toFixed(1):"-"}</td><td class="num">${r.y||"-"}</td><td class="num">${r.q}</td>
   <td class="num">${r.v?"$"+Number(r.v).toLocaleString():"-"}</td>
-  <td class="stc"><span class="s-${r.st}">${ST[r.st]||r.st}</span>${r.drop?`<span class="tag new" title="Was: ${esc(ST[r.was]||r.was)}">Dropped ${r.drop.slice(5)}</span>`:""}${["AVAILABLE","LIKELY_AVAILABLE"].includes(r.st)&&BUY?`<a class="buy" href="${esc(BUY.replace("DOMAIN",encodeURIComponent(r.d)))}" target="_blank" rel="noopener">Register</a>`:""}</td>
+  <td class="stc"><span class="s-${r.st}">${ST[r.st]||r.st}</span>${r.drop?`<span class="tag new" title="Was: ${esc(ST[r.was]||r.was)}">Dropped ${r.drop.slice(5)}</span>`:""}${r.sp?`<span class="tag warn" title="Archive shows spam: ${esc(r.sp)}">&#9888; spam history</span>`:""}${["AVAILABLE","LIKELY_AVAILABLE"].includes(r.st)&&BUY?`<a class="buy" href="${esc(BUY.replace("DOMAIN",encodeURIComponent(r.d)))}" target="_blank" rel="noopener">Register</a>`:""}</td>
   <td class="num opt">${r.found}</td></tr>`;}
 function apply(){closePop();const q=$("q").value.trim().toLowerCase(),g=$("st").value,via=$("via").value,tld=$("tld").value,
-  dfo=$("dfo").checked,ns=$("nospam").checked,amin=+$("au").value,mv=$("mk").value;
+  dfo=$("dfo").checked,ns=$("nospam").checked,amin=+$("au").value,mv=$("mk").value,nsh=$("nosph").checked;
   const cut=new Date(Date.now()-14*864e5).toISOString().slice(0,10);
   VIEW=ALL.filter(r=>(g==="all"||(g==="new"?r.drop>=cut:GROUP[g].includes(r.st)))&&(!via||r.s.some(s=>s.via===via))&&(!tld||r.tld===tld)
-    &&(!dfo||r.df>0||r.n===0)&&(!ns||!r.spam)&&r.au>=amin
+    &&(!dfo||r.df>0||r.n===0)&&(!ns||!r.spam)&&(!nsh||!r.sp)&&r.au>=amin
     &&(()=>{const m=mk(r.d);return mv===""?!m.h:mv==="u"?!m.c&&!m.h:!!m[mv]})()
     &&(!q||r.d.includes(q)||r.s.some(s=>s.u.toLowerCase().includes(q)||s.a.toLowerCase().includes(q))));
   const k=sortK,m=asc?1:-1;
@@ -491,9 +495,9 @@ function render(){const n=VIEW.length,pages=Math.max(1,Math.ceil(n/PER));page=Ma
   $("pno").textContent=`Page ${page+1} of ${pages}`;$("prev").disabled=page===0;$("next").disabled=page>=pages-1;
   document.querySelectorAll("th[data-k]").forEach(th=>{th.classList.toggle("on",th.dataset.k===sortK);th.classList.toggle("asc",th.dataset.k===sortK&&asc)});}
 function save(){try{localStorage.setItem("df-t2",JSON.stringify({mk:$("mk").value,st:$("st").value,via:$("via").value,tld:$("tld").value,au:$("au").value,
-  dfo:$("dfo").checked,ns:$("nospam").checked,k:sortK,asc}))}catch(e){}}
+  dfo:$("dfo").checked,ns:$("nospam").checked,nsh:$("nosph").checked,k:sortK,asc}))}catch(e){}}
 function restore(){try{const o=JSON.parse(localStorage.getItem("df-t2")||"{}");if(o.st)$("st").value=o.st;if(o.mk)$("mk").value=o.mk;if(o.au)$("au").value=o.au;
-  if(o.via)$("via").value=o.via;if(o.tld)$("tld").value=o.tld;$("dfo").checked=!!o.dfo;if(o.ns===false)$("nospam").checked=false;
+  if(o.via)$("via").value=o.via;if(o.tld)$("tld").value=o.tld;$("dfo").checked=!!o.dfo;if(o.ns===false)$("nospam").checked=false;$("nosph").checked=!!o.nsh;
   if(o.k){sortK=o.k;asc=!!o.asc}}catch(e){}}
 function fill(sel,counts,label){Object.entries(counts).sort((a,b)=>b[1]-a[1]).forEach(([k,c])=>{
   const o=document.createElement("option");o.value=k;o.textContent=`${label(k)} (${c})`;$(sel).appendChild(o)});}
@@ -502,7 +506,7 @@ document.querySelector("thead").addEventListener("click",e=>{const th=e.target.c
 $("rows").addEventListener("click",e=>{const b=e.target.closest(".more");if(!b)return;const x=b.previousElementSibling;
   x.hidden=!x.hidden;b.textContent=x.hidden?b.dataset.t:"Show less";});
 document.addEventListener("click",e=>{const b=e.target.closest(".more");if(b&&!b.dataset.t)b.dataset.t=b.textContent},true);
-["q","st","via","tld","au","mk","dfo","nospam"].forEach(id=>$(id).addEventListener(id==="q"?"input":"change",apply));
+["q","st","via","tld","au","mk","dfo","nospam","nosph"].forEach(id=>$(id).addEventListener(id==="q"?"input":"change",apply));
 let popI=-1,popPinned=false,hoverT=0;
 function qlinks(d){const e=encodeURIComponent;return [
   ["Google mentions","https://www.google.com/search?q="+e('"'+d+'"')],["Google site:","https://www.google.com/search?q="+e("site:"+d)],
@@ -513,6 +517,7 @@ function openPop(i,cell,pin){const r=VIEW[i];if(!r)return;popI=i;popPinned=!!pin
   P.innerHTML=`<div class="ph"><div class="pd">${esc(r.d)}</div><button class="x" data-act="close" aria-label="Close">&times;</button></div>
   <div class="facts"><b class="s-${r.st}">${ST[r.st]||r.st}</b>${r.drop?` &middot; dropped ${r.drop}`:""} &middot; Authority <b>${r.au?r.au.toFixed(1):"-"}</b>
    &middot; Quality <b>${r.q}</b> &middot; Since <b>${r.y||"-"}</b> &middot; Value <b>${r.v?"$"+Number(r.v).toLocaleString():"-"}</b></div>
+  ${r.sp?`<div class="spw">&#9888; Archived pages show spam (${esc(r.sp)}). Check the Wayback history before buying.</div>`:r.spc?`<div class="spok">&#10003; No spam found in archived pages</div>`:""}
   <div class="marks"><button data-act="s" class="${m.s?"on":""}">&#9733; Shortlist</button><button data-act="c" class="${m.c?"on":""}">&#10003; Checked</button><button data-act="h" class="${m.h?"on":""}">&#10005; Hide</button></div>
   <h4>Check it</h4><div class="qc">${qlinks(r.d).map(([t,u])=>`<a href="${esc(u)}" target="_blank" rel="noopener nofollow">${t}</a>`).join("")}
    <button data-act="copy">Copy domain</button></div>
