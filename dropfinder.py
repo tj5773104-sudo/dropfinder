@@ -618,10 +618,15 @@ def cc_web_ranks(domains, session=None, log=lambda m: None, max_seconds=1200, ur
     s = session or requests.Session()
     s.headers["User-Agent"] = UA
     if url is None:
-        try:
-            rel = s.get(CC_INDEX, timeout=30).json()[0]["id"]
-        except (requests.RequestException, ValueError, KeyError, IndexError) as e:
-            log(f"  Common Crawl index unavailable: {e}")
+        rel = None
+        for attempt in range(3):
+            try:
+                rel = s.get(CC_INDEX, timeout=30).json()[0]["id"]
+                break
+            except (requests.RequestException, ValueError, KeyError, IndexError) as e:
+                log(f"  Common Crawl index unavailable (try {attempt + 1}): {e}")
+                time.sleep(15 * (attempt + 1))
+        if not rel:
             return {}
         url = f"{CC_BASE}/{rel}/domain/{rel}-domain-ranks.txt.gz"
         log(f"  streaming {rel} domain ranks...")
@@ -961,7 +966,13 @@ def wikidata_defunct(per_type=3000, types=None, session=None, rng=random, log=la
              "?item wdt:P576 ?end . SERVICE wikibase:label { bd:serviceParam wikibase:language \"en\" } } LIMIT %d"
              % (qid, per_type))
         try:
-            r = s.get("https://query.wikidata.org/sparql", params={"query": q, "format": "json"}, timeout=90)
+            for attempt in range(3):
+                r = s.get("https://query.wikidata.org/sparql", params={"query": q, "format": "json"}, timeout=90)
+                if r.status_code not in (429, 502, 503, 504):
+                    break
+                wait = min(90, int(r.headers.get("Retry-After") or 0) or 30 * (attempt + 1))
+                log(f"  Wikidata busy (HTTP {r.status_code}), retrying in {wait}s")
+                time.sleep(wait)
             rows = r.json()["results"]["bindings"]
         except (requests.RequestException, ValueError, KeyError) as e:
             log(f"  Wikidata {WD_TYPES.get(qid, qid)}: failed ({type(e).__name__})")
@@ -1744,6 +1755,15 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
             recs = []
         log(f"  {len(recs)} links ({sum(r['follow'] == 'dofollow' for r in recs)} dofollow)")
         records.extend(recs)
+    if wikidata_old:
+        log("Reading former official websites of notable organisations from Wikidata...")
+        try:
+            recs = wikidata_old_websites(wikidata_old, rng=rng, log=log)
+        except Exception as e:  # noqa: BLE001
+            log(f"  failed: {type(e).__name__}: {e}")
+            recs = []
+        records.extend(recs)
+        time.sleep(20)  # Wikidata rate-limits back-to-back heavy queries
     if wikidata_types:
         log("Reading defunct organisations from Wikidata...")
         types = rng.sample(list(WD_TYPES), min(wikidata_types, len(WD_TYPES)))
@@ -1753,14 +1773,6 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
             log(f"  failed: {type(e).__name__}: {e}")
             recs = []
         log(f"  {len(recs)} official websites of closed organisations")
-        records.extend(recs)
-    if wikidata_old:
-        log("Reading former official websites of notable organisations from Wikidata...")
-        try:
-            recs = wikidata_old_websites(wikidata_old, rng=rng, log=log)
-        except Exception as e:  # noqa: BLE001
-            log(f"  failed: {type(e).__name__}: {e}")
-            recs = []
         records.extend(recs)
     if dmoz_sample:
         log("Reading the DMOZ directory dump...")
@@ -2015,7 +2027,7 @@ def graph_scan(pairs, info, log, label):
 def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_minutes=40, sites=100,
          wiki_months=2, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=6000,
          seed=None, hn_months=4, debian_sample=1500, cordis_sample=1500, cc_ranks=True,
-         sd_pages=0, majestic_batch=0, cc_batch=0, wayback_checks=150, wikidata_types=8,
+         sd_pages=0, majestic_batch=0, cc_batch=0, wayback_checks=800, wikidata_types=8,
          publisher_sites=9, wikidata_old=3000, dmoz_sample=3000, resource_domains=4, watch_top=1500, log=print):
     """Fully automatic run.
     Authority-first: StableDomains quality drop feed, a rotating batch of the Majestic Million and of the
@@ -2161,16 +2173,21 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     live = [r for r in old.values() if r.get("status") not in ("TAKEN", "REGISTERED")]
     todo = [r for r in live if r.get("via") != "stabledomains" and r.get("real_years") in (None,)
             and r.get("status") in ("AVAILABLE", "LIKELY_AVAILABLE", "PENDING_DELETE", "REDEMPTION", "EXPIRED_GRACE")]
-    todo.sort(key=lambda r: -((r.get("ref_subnets") or 0) + (r.get("cc_authority") or 0) * 50 + r.get("score", 0) * 20))
+    todo.sort(key=lambda r: -((r.get("ref_subnets") or 0) + (r.get("cc_authority") or 0) * 50 + r.get("score", 0) * 20
+                               + len(r.get("sources") or []) * 5))
     todo = todo[:wayback_checks] if time.time() < t0 + budget_minutes * 60 * 0.95 else todo[:30]
     if todo:
-        log(f"Checking Wayback real-site history for {len(todo)} candidates...")
+        wb_end = max(time.time() + 120, t0 + budget_minutes * 60 * 0.93)
+        log(f"Checking Wayback real-site history for {len(todo)} candidates "
+            f"({sum(1 for r in live if r.get('real_years') is None)} still unchecked)...")
         sess = requests.Session()
         sess.headers["User-Agent"] = UA
-        with ThreadPoolExecutor(3) as ex:
+        with ThreadPoolExecutor(5) as ex:
             def wb_safe(r):
+                if time.time() > wb_end:  # out of time: leave it unchecked for the next run
+                    return {}
                 try:
-                    return wayback_real_history(r["domain"], sess)
+                    return wayback_real_history(r["domain"], sess, samples=3)
                 except Exception:  # noqa: BLE001
                     return {}
             for r, h in zip(todo, ex.map(wb_safe, todo)):
@@ -2384,7 +2401,7 @@ def main():
     k.add_argument("--sd-pages", type=int, default=0, help="pages (25 rows) of the StableDomains quality feed")
     k.add_argument("--majestic", type=int, default=0, help="Majestic Million domains to DNS-scan per run")
     k.add_argument("--cc-batch", type=int, default=0, help="top Common Crawl domains to DNS-scan per run")
-    k.add_argument("--wayback-checks", type=int, default=150, help="candidates to verify in the Wayback Machine")
+    k.add_argument("--wayback-checks", type=int, default=800, help="candidates to verify in the Wayback Machine")
     k.add_argument("--wikidata-types", type=int, default=8, help="random kinds of defunct organisations to read")
     k.add_argument("--wikidata-old", type=int, default=3000, help="former official websites to read from Wikidata")
     k.add_argument("--dmoz", type=int, default=3000, help="random DMOZ directory listings to check")

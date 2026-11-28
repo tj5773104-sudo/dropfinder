@@ -309,7 +309,7 @@ def table_rows():
         out.append({
             "d": d, "tld": d.split(".", 1)[1] if "." in d else "", "st": r.get("status", ""),
             "q": r.get("quality") or 0, "v": r.get("est_value") or 0,
-            "y": str(r.get("wb_first") or "")[:4], "n": len(src),
+            "y": str(r.get("wb_first") or "")[:4], "n": len(src), "au": r.get("cc_authority") or 0,
             "df": sum(1 for s in src if s.get("follow") == "dofollow"),
             "via": src[0].get("via") or "", "found": (r.get("first_seen") or "")[:10],
             "spam": bool(df.SPAM_RE.search(d.split(".")[0])),
@@ -400,11 +400,12 @@ footer{color:var(--m);font-size:12px;padding:8px 12px 20px}
 <div class="wrap"><table>
 <thead><tr>
   <th data-k="d">Domain</th><th class="ns">Linked from &ndash; tap to see the link</th><th data-k="n">Links</th>
+  <th data-k="au" title="How strongly the whole web links to this domain (Common Crawl web graph), 0-10">Authority</th>
   <th data-k="y">Since</th><th data-k="q">Quality</th><th data-k="v">Value</th>
   <th data-k="st">Status</th><th data-k="found" class="opt">Found</th>
 </tr></thead><tbody id="rows"></tbody></table></div>
 <div class="pg"><button id="prev">&lsaquo; Prev</button><span id="pno"></span><button id="next">Next &rsaquo;</button></div>
-<footer>Est. value is a rough guide from link and history signals, not an appraisal. Quality (0-100) weighs real-site history, dofollow links and the linking site's authority. Always check a domain's history before buying.</footer>
+<footer>Est. value is a rough guide from link and history signals, not an appraisal. Authority (0-10) is how strongly the whole web links to the domain, from the Common Crawl web graph. Quality (0-100) weighs real-site history, dofollow links and authority. Always check a domain's history before buying.</footer>
 <script>
 const VIA={wikipedia:"Wikipedia",cordis:"EU research projects",wikidata:"Closed organisations",crawl:"Top websites",
   hackernews:"Hacker News",debian:"Debian packages",publishers:"News & gov archives",github:"GitHub",seed:"Your seeds",
@@ -433,7 +434,7 @@ function row(r,i){const extra=r.s.length-1;
    <button class="more" data-i="${i}">+${extra} more page${extra>1?"s":""}</button>`:""}
    <span class="anc">${esc(VIA[r.via]||r.via)}</span></td>
   <td class="num">${r.n}</td>
-  <td class="num">${r.y||"-"}</td><td class="num">${r.q}</td>
+  <td class="num">${r.au?r.au.toFixed(1):"-"}</td><td class="num">${r.y||"-"}</td><td class="num">${r.q}</td>
   <td class="num">${r.v?"$"+Number(r.v).toLocaleString():"-"}</td>
   <td class="stc"><span class="s-${r.st}">${ST[r.st]||r.st}</span>${r.drop?`<span class="tag new" title="Was: ${esc(ST[r.was]||r.was)}">Dropped ${r.drop.slice(5)}</span>`:""}${["AVAILABLE","LIKELY_AVAILABLE"].includes(r.st)&&BUY?`<a class="buy" href="${esc(BUY.replace("DOMAIN",encodeURIComponent(r.d)))}" target="_blank" rel="noopener">Register</a>`:""}</td>
   <td class="num opt">${r.found}</td></tr>`;}
@@ -451,7 +452,7 @@ function apply(){const q=$("q").value.trim().toLowerCase(),g=$("st").value,via=$
 function render(){const n=VIEW.length,pages=Math.max(1,Math.ceil(n/PER));page=Math.min(page,pages-1);
   const slice=VIEW.slice(page*PER,page*PER+PER);
   $("rows").innerHTML=slice.length?slice.map((r,i)=>row(r,page*PER+i)).join(""):
-    `<tr><td colspan="8" class="empty">No domains match these filters.</td></tr>`;
+    `<tr><td colspan="9" class="empty">No domains match these filters.</td></tr>`;
   $("count").textContent=`${n.toLocaleString()} domains (of ${ALL.length.toLocaleString()})`;
   $("pno").textContent=`Page ${page+1} of ${pages}`;$("prev").disabled=page===0;$("next").disabled=page>=pages-1;
   document.querySelectorAll("th[data-k]").forEach(th=>{th.classList.toggle("on",th.dataset.k===sortK);th.classList.toggle("asc",th.dataset.k===sortK&&asc)});}
