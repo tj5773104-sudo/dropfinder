@@ -782,7 +782,7 @@ def wayback_real_history(domain, session, samples=4):
     """Sample archived homepages across the years and classify each as real content vs parked/for-sale/empty.
     Returns {"real_ratio", "real_years", "wb_first", "wb_last", "wb_years", "parked_only"}."""
     try:
-        r = session.get("https://web.archive.org/cdx/search/cdx", timeout=30, params={
+        r = archive_get(session, "https://web.archive.org/cdx/search/cdx", timeout=30, params={
             "url": domain, "output": "json", "fl": "timestamp,original", "filter": "statuscode:200",
             "collapse": "timestamp:4", "limit": "60"})
         rows = [(str(x[0]), str(x[1]) if len(x) > 1 else f"http://{domain}/") for x in r.json()[1:]
@@ -797,7 +797,7 @@ def wayback_real_history(domain, session, samples=4):
     real = 0
     for ts, orig in picks:
         try:
-            pr = session.get(f"https://web.archive.org/web/{ts}id_/{orig}", timeout=25, stream=True)
+            pr = archive_get(session, f"https://web.archive.org/web/{ts}id_/{orig}", timeout=25, stream=True)
             body = safe_decode(read_capped(pr, 400_000, 15), pr.encoding)
             pr.close()
         except requests.RequestException:
@@ -807,7 +807,6 @@ def wayback_real_history(domain, session, samples=4):
         words = len(re.findall(r"[A-Za-zÀ-ɏ]{3,}", text))
         if words >= WB_REAL_MIN_WORDS and not PARK_RE.search(text[:20000]):
             real += 1
-        time.sleep(0.7)
     ratio = real / max(1, len(picks))
     span = years[-1] - years[0] + 1
     return {"real_ratio": round(ratio, 2), "real_years": round(span * ratio, 1), "wb_first": str(years[0]),
@@ -1007,12 +1006,13 @@ def wikidata_old_websites(limit=3000, min_sitelinks=6, session=None, rng=random,
     }
     out, seen = [], set()
     for kind, cond in queries.items():
-        off = rng.choice([0, limit, 2 * limit, 3 * limit, 4 * limit])
+        off = rng.choice([0, 0, limit, 2 * limit])
         q = ("SELECT ?item ?itemLabel ?site ?end ?links WHERE { "
-             "{ SELECT ?item ?site ?end WHERE { ?item p:P856 ?st . ?st ps:P856 ?site . %s } LIMIT %d OFFSET %d } "
+             "{ SELECT ?item ?site ?end WHERE { hint:Query hint:optimizer \"None\" . "
+             "?item p:P856 ?st . %s ?st ps:P856 ?site . } LIMIT %d OFFSET %d } "
              "?item wikibase:sitelinks ?links . FILTER(?links >= %d) "
              "OPTIONAL { ?item rdfs:label ?itemLabel . FILTER(LANG(?itemLabel) = \"en\") } }"
-             % (cond, limit * 4, off * 4, min_sitelinks))
+             % (cond, limit, off, min_sitelinks))
         try:
             r = s.get("https://query.wikidata.org/sparql", params={"query": q, "format": "json"}, timeout=90)
             rows = r.json()["results"]["bindings"]
@@ -1459,6 +1459,25 @@ class RateLimiter:
             time.sleep(slot - now)
 
 
+ARCHIVE = RateLimiter(0.8)  # archive.org starts answering 429 when hit faster than ~1-2 requests/s
+
+
+def archive_get(session, url, tries=3, **kw):
+    """GET from web.archive.org through a shared rate limiter, backing off when it says it's busy."""
+    r = None
+    for attempt in range(tries):
+        ARCHIVE.wait()
+        r = session.get(url, **kw)
+        if r.status_code not in (429, 502, 503, 504):
+            return r
+        try:
+            r.close()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(min(120, int(r.headers.get("Retry-After") or 0) or 20 * (attempt + 1)))
+    return r
+
+
 def load_rdap_bootstrap(session):
     data = session.get("https://data.iana.org/rdap/dns.json", timeout=30).json()
     m = {}
@@ -1578,7 +1597,7 @@ def site_state(domain, session, public_only=False):
 
 def wayback_summary(domain, session):
     try:
-        r = session.get("https://web.archive.org/cdx/search/cdx",
+        r = archive_get(session, "https://web.archive.org/cdx/search/cdx",
                         params={"url": domain, "output": "json", "fl": "timestamp", "filter": "statuscode:200",
                                 "collapse": "timestamp:6", "limit": "1000"}, timeout=30)
         rows = r.json()[1:]
@@ -2144,6 +2163,30 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
         log(f"Re-checking {len(stale)} domains from earlier runs...")
         recheck(stale)
 
+    # 6. Wayback real-history check for unverified candidates (best first), then Quality for everything
+    live = [r for r in old.values() if r.get("status") not in ("TAKEN", "REGISTERED")]
+    todo = [r for r in live if r.get("via") != "stabledomains" and r.get("real_years") in (None,)
+            and r.get("status") in ("AVAILABLE", "LIKELY_AVAILABLE", "PENDING_DELETE", "REDEMPTION", "EXPIRED_GRACE")]
+    todo.sort(key=lambda r: -((r.get("ref_subnets") or 0) + (r.get("cc_authority") or 0) * 50 + r.get("score", 0) * 20
+                               + len(r.get("sources") or []) * 5))
+    todo = todo[:wayback_checks] if time.time() < t0 + budget_minutes * 60 * 0.95 else todo[:30]
+    if todo:
+        wb_end = max(time.time() + 120, min(time.time() + 30 * 60, t0 + budget_minutes * 60 * 0.8))
+        log(f"Checking Wayback real-site history for {len(todo)} candidates "
+            f"({sum(1 for r in live if r.get('real_years') is None)} still unchecked)...")
+        sess = requests.Session()
+        sess.headers["User-Agent"] = UA
+        with ThreadPoolExecutor(5) as ex:
+            def wb_safe(r):
+                if time.time() > wb_end:  # out of time: leave it unchecked for the next run
+                    return {}
+                try:
+                    return wayback_real_history(r["domain"], sess, samples=2)
+                except Exception:  # noqa: BLE001
+                    return {}
+            for r, h in zip(todo, ex.map(wb_safe, todo)):
+                if h:
+                    r.update({k: v for k, v in h.items() if v not in (None, "") or k in ("real_years",)})
     # 5. Common Crawl: authority for every candidate + a rotating window of top-ranked domains to scan
     if cc_ranks and time_left("Common Crawl"):
         need = [d for d, r in old.items() if r.get("status") != "TAKEN" and r.get("cc_rank") in (None,)]
@@ -2169,30 +2212,6 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
                 _merge(old, r, stamp)
             by_source["commoncrawl"] = len(cands)
 
-    # 6. Wayback real-history check for unverified candidates (best first), then Quality for everything
-    live = [r for r in old.values() if r.get("status") not in ("TAKEN", "REGISTERED")]
-    todo = [r for r in live if r.get("via") != "stabledomains" and r.get("real_years") in (None,)
-            and r.get("status") in ("AVAILABLE", "LIKELY_AVAILABLE", "PENDING_DELETE", "REDEMPTION", "EXPIRED_GRACE")]
-    todo.sort(key=lambda r: -((r.get("ref_subnets") or 0) + (r.get("cc_authority") or 0) * 50 + r.get("score", 0) * 20
-                               + len(r.get("sources") or []) * 5))
-    todo = todo[:wayback_checks] if time.time() < t0 + budget_minutes * 60 * 0.95 else todo[:30]
-    if todo:
-        wb_end = max(time.time() + 120, t0 + budget_minutes * 60 * 0.93)
-        log(f"Checking Wayback real-site history for {len(todo)} candidates "
-            f"({sum(1 for r in live if r.get('real_years') is None)} still unchecked)...")
-        sess = requests.Session()
-        sess.headers["User-Agent"] = UA
-        with ThreadPoolExecutor(5) as ex:
-            def wb_safe(r):
-                if time.time() > wb_end:  # out of time: leave it unchecked for the next run
-                    return {}
-                try:
-                    return wayback_real_history(r["domain"], sess, samples=3)
-                except Exception:  # noqa: BLE001
-                    return {}
-            for r, h in zip(todo, ex.map(wb_safe, todo)):
-                if h:
-                    r.update({k: v for k, v in h.items() if v not in (None, "") or k in ("real_years",)})
     # anchor value estimates to StableDomains' own (free) estimate for the most promising candidates
     top = sorted((r for r in old.values() if r.get("status") in ("AVAILABLE", "LIKELY_AVAILABLE", "PENDING_DELETE",
                   "REDEMPTION", "EXPIRED_GRACE") and not r.get("value_usd")),
