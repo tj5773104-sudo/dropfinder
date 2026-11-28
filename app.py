@@ -302,20 +302,26 @@ def table_rows():
     out = []
     for r in f["rows"]:
         src = real_sources(r)
+        rank = str(r.get("cc_rank") or "")
+        au = df.cc_authority(int(rank)) if rank.isdigit() else 0
         if not src:
-            continue
+            if "commoncrawl" not in (r.get("via") or "") or au < 1:
+                continue
+            # found by the web-graph sweep: many sites link to it, no single crawled page to show
+            src = [{"url": "https://ahrefs.com/backlink-checker/?input=" + r["domain"] + "&mode=subdomains",
+                    "anchor": "", "follow": "", "via": "commoncrawl", "graph": True}]
         src.sort(key=lambda s: (s.get("follow") != "dofollow", not s.get("anchor")))
         d = r["domain"]
         out.append({
             "d": d, "tld": d.split(".", 1)[1] if "." in d else "", "st": r.get("status", ""),
             "q": r.get("quality") or 0, "v": r.get("est_value") or 0,
-            "y": str(r.get("wb_first") or "")[:4], "n": len(src), "au": r.get("cc_authority") or 0,
+            "y": str(r.get("wb_first") or "")[:4], "n": 0 if src[0].get("graph") else len(src), "au": au or 0,
             "df": sum(1 for s in src if s.get("follow") == "dofollow"),
             "via": src[0].get("via") or "", "found": (r.get("first_seen") or "")[:10],
             "spam": bool(df.SPAM_RE.search(d.split(".")[0])),
             "drop": (r.get("dropped_at") or "")[:10], "was": r.get("prev_status") or "",
             "s": [{"u": s["url"], "a": (s.get("anchor") or "")[:120], "f": s.get("follow") or "",
-                   "via": s.get("via") or ""} for s in src[:5]],
+                   "via": s.get("via") or "", **({"g": 1} if s.get("graph") else {})} for s in src[:5]],
         })
     with LOCK:
         FEED.update(table=out, table_at=FEED["at"])
@@ -393,6 +399,7 @@ footer{color:var(--m);font-size:12px;padding:8px 12px 20px}
   </select>
   <select id="via"><option value="">All sources</option></select>
   <select id="tld"><option value="">All TLDs</option></select>
+  <select id="au"><option value="1">Authority 1+</option><option value="3">Strong only (3+)</option><option value="0">Any authority</option></select>
   <label><input type="checkbox" id="dfo"> Dofollow only</label>
   <label><input type="checkbox" id="nospam" checked> Hide spam</label>
 </div>
@@ -409,13 +416,13 @@ footer{color:var(--m);font-size:12px;padding:8px 12px 20px}
 <script>
 const VIA={wikipedia:"Wikipedia",cordis:"EU research projects",wikidata:"Closed organisations",crawl:"Top websites",
   hackernews:"Hacker News",debian:"Debian packages",publishers:"News & gov archives",github:"GitHub",seed:"Your seeds",
-  wikidata_old:"Former official sites",dmoz:"DMOZ directory",resources:"Gov/edu links pages",press:"Press releases"};
+  commoncrawl:"Web-graph sweep",wikidata_old:"Former official sites",dmoz:"DMOZ directory",resources:"Gov/edu links pages",press:"Press releases"};
 const ST={AVAILABLE:"Available",LIKELY_AVAILABLE:"Likely free",PENDING_DELETE:"Pending delete",REDEMPTION:"Redemption",
   EXPIRED_GRACE:"Expired (grace)",EXPIRING_SOON:"Expiring",DEAD_SITE:"Dead site",PARKED:"Parked"};
 const GROUP={buy:["AVAILABLE","LIKELY_AVAILABLE"],drop:["PENDING_DELETE","REDEMPTION","EXPIRED_GRACE","EXPIRING_SOON"],
   dead:["DEAD_SITE","PARKED"]};
 const SO={AVAILABLE:0,LIKELY_AVAILABLE:1,PENDING_DELETE:2,REDEMPTION:3,EXPIRED_GRACE:4,EXPIRING_SOON:5,DEAD_SITE:6,PARKED:7};
-const PER=100; let BUY="", ALL=[], VIEW=[], page=0, sortK="q", asc=false;
+const PER=100; let BUY="", ALL=[], VIEW=[], page=0, sortK="au", asc=false;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const safe=u=>/^https?:\/\//i.test(u||"");
@@ -424,7 +431,8 @@ const frag=t=>encodeURIComponent(t).replace(/-/g,"%2D").replace(/,/g,"%2C");
 function jump(s){const b=s.u.split("#")[0];let t=(s.a||"").replace(/\s+/g," ").trim();
   if(t.length>70)t=t.slice(0,70).replace(/\s+\S*$/,"");
   return t.length>=3&&!/^https?:/i.test(t)&&s.via!=="wikipedia"?b+"#:~:text="+frag(t):b;}
-function srcHtml(s){if(!safe(s.u))return"";const p=s.u.replace(/^https?:\/\/(www\.)?/,"");
+function srcHtml(s){if(!safe(s.u))return"";
+  if(s.g)return `<div>Linked from many sites across the web<span class="anc"><a href="${esc(s.u)}" target="_blank" rel="noopener nofollow">See its backlinks &rsaquo;</a></span></div>`;const p=s.u.replace(/^https?:\/\/(www\.)?/,"");
   return `<div><a href="${esc(jump(s))}" target="_blank" rel="noopener nofollow">${esc(p.length>70?p.slice(0,70)+"…":p)}</a>
   <span class="tag ${s.f==="dofollow"?"df":"nf"}">${s.f==="dofollow"?"dofollow":s.f||"link"}</span>
   ${s.a?`<span class="anc">“${esc(s.a)}”</span>`:""}</div>`;}
@@ -433,16 +441,16 @@ function row(r,i){const extra=r.s.length-1;
   <td class="src">${srcHtml(r.s[0])}${extra>0?`<div class="x" hidden>${r.s.slice(1).map(srcHtml).join("")}</div>
    <button class="more" data-i="${i}">+${extra} more page${extra>1?"s":""}</button>`:""}
    <span class="anc">${esc(VIA[r.via]||r.via)}</span></td>
-  <td class="num">${r.n}</td>
+  <td class="num">${r.n||"web"}</td>
   <td class="num">${r.au?r.au.toFixed(1):"-"}</td><td class="num">${r.y||"-"}</td><td class="num">${r.q}</td>
   <td class="num">${r.v?"$"+Number(r.v).toLocaleString():"-"}</td>
   <td class="stc"><span class="s-${r.st}">${ST[r.st]||r.st}</span>${r.drop?`<span class="tag new" title="Was: ${esc(ST[r.was]||r.was)}">Dropped ${r.drop.slice(5)}</span>`:""}${["AVAILABLE","LIKELY_AVAILABLE"].includes(r.st)&&BUY?`<a class="buy" href="${esc(BUY.replace("DOMAIN",encodeURIComponent(r.d)))}" target="_blank" rel="noopener">Register</a>`:""}</td>
   <td class="num opt">${r.found}</td></tr>`;}
 function apply(){const q=$("q").value.trim().toLowerCase(),g=$("st").value,via=$("via").value,tld=$("tld").value,
-  dfo=$("dfo").checked,ns=$("nospam").checked;
+  dfo=$("dfo").checked,ns=$("nospam").checked,amin=+$("au").value;
   const cut=new Date(Date.now()-14*864e5).toISOString().slice(0,10);
   VIEW=ALL.filter(r=>(g==="all"||(g==="new"?r.drop>=cut:GROUP[g].includes(r.st)))&&(!via||r.s.some(s=>s.via===via))&&(!tld||r.tld===tld)
-    &&(!dfo||r.df>0)&&(!ns||!r.spam)
+    &&(!dfo||r.df>0||r.n===0)&&(!ns||!r.spam)&&r.au>=amin
     &&(!q||r.d.includes(q)||r.s.some(s=>s.u.toLowerCase().includes(q)||s.a.toLowerCase().includes(q))));
   const k=sortK,m=asc?1:-1;
   VIEW.sort((a,b)=>{let x=a[k],y=b[k];if(k==="y"){const z=asc?"9999":"0000";x=x||z;y=y||z}
@@ -456,9 +464,9 @@ function render(){const n=VIEW.length,pages=Math.max(1,Math.ceil(n/PER));page=Ma
   $("count").textContent=`${n.toLocaleString()} domains (of ${ALL.length.toLocaleString()})`;
   $("pno").textContent=`Page ${page+1} of ${pages}`;$("prev").disabled=page===0;$("next").disabled=page>=pages-1;
   document.querySelectorAll("th[data-k]").forEach(th=>{th.classList.toggle("on",th.dataset.k===sortK);th.classList.toggle("asc",th.dataset.k===sortK&&asc)});}
-function save(){try{localStorage.setItem("df-t",JSON.stringify({st:$("st").value,via:$("via").value,tld:$("tld").value,
+function save(){try{localStorage.setItem("df-t2",JSON.stringify({st:$("st").value,via:$("via").value,tld:$("tld").value,au:$("au").value,
   dfo:$("dfo").checked,ns:$("nospam").checked,k:sortK,asc}))}catch(e){}}
-function restore(){try{const o=JSON.parse(localStorage.getItem("df-t")||"{}");if(o.st)$("st").value=o.st;
+function restore(){try{const o=JSON.parse(localStorage.getItem("df-t2")||"{}");if(o.st)$("st").value=o.st;if(o.au)$("au").value=o.au;
   if(o.via)$("via").value=o.via;if(o.tld)$("tld").value=o.tld;$("dfo").checked=!!o.dfo;if(o.ns===false)$("nospam").checked=false;
   if(o.k){sortK=o.k;asc=!!o.asc}}catch(e){}}
 function fill(sel,counts,label){Object.entries(counts).sort((a,b)=>b[1]-a[1]).forEach(([k,c])=>{
@@ -468,7 +476,7 @@ document.querySelector("thead").addEventListener("click",e=>{const th=e.target.c
 $("rows").addEventListener("click",e=>{const b=e.target.closest(".more");if(!b)return;const x=b.previousElementSibling;
   x.hidden=!x.hidden;b.textContent=x.hidden?b.dataset.t:"Show less";});
 document.addEventListener("click",e=>{const b=e.target.closest(".more");if(b&&!b.dataset.t)b.dataset.t=b.textContent},true);
-["q","st","via","tld","dfo","nospam"].forEach(id=>$(id).addEventListener(id==="q"?"input":"change",apply));
+["q","st","via","tld","au","dfo","nospam"].forEach(id=>$(id).addEventListener(id==="q"?"input":"change",apply));
 $("prev").onclick=()=>{page--;render();scrollTo(0,0)};$("next").onclick=()=>{page++;render();scrollTo(0,0)};
 fetch("/table.json").then(r=>r.json()).then(j=>{ALL=j.rows||[];BUY=j.buy||"";
   const v={},t={};ALL.forEach(r=>{new Set(r.s.map(s=>s.via)).forEach(x=>{if(x)v[x]=(v[x]||0)+1});t[r.tld]=(t[r.tld]||0)+1});

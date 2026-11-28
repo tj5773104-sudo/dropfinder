@@ -599,7 +599,10 @@ CC_INDEX = "https://index.commoncrawl.org/graphinfo.json"
 CC_BASE = "https://data.commoncrawl.org/projects/hyperlinkgraph"
 
 
-def cc_authority(pos, total):
+CC_TOTAL = 1.0e8  # rows in a Common Crawl domain-ranks file; one fixed scale so scores compare across runs
+
+
+def cc_authority(pos, total=CC_TOTAL):
     """0-10 score from a harmonic-centrality position among `total` domains (log scale, like PageRank)."""
     import math
     if not pos or pos < 1:
@@ -607,7 +610,8 @@ def cc_authority(pos, total):
     return round(max(0.0, 10 * (1 - math.log10(pos) / math.log10(max(total, 10)))), 1)
 
 
-def cc_web_ranks(domains, session=None, log=lambda m: None, max_seconds=1200, url=None, window=None, window_out=None):
+def cc_web_ranks(domains, session=None, log=lambda m: None, max_seconds=1200, url=None, window=None, window_out=None,
+                 window_filter=None, progress=None):
     """Stream Common Crawl's latest domain-level ranks file (several GB, gzip) once and return
     {domain: {"cc_rank": harmonic-centrality position, "cc_pr_rank": pagerank position, "cc_authority": 0-10}}.
     Dead domains keep a rank while other sites still link to them - that is the point."""
@@ -648,18 +652,23 @@ def cc_web_ranks(domains, session=None, log=lambda m: None, max_seconds=1200, ur
                 if key in want:
                     found[want[key]] = (int(parts[0]), int(parts[2]))
                 if window and window_out is not None and window[0] <= idx < window[1]:
-                    window_out.append((".".join(reversed(key.decode("utf-8", "replace").split("."))),
-                                       int(parts[0]), int(parts[2])))
+                    dom = ".".join(reversed(key.decode("utf-8", "replace").split(".")))
+                    if window_filter is None or window_filter(dom):
+                        window_out.append((dom, int(parts[0]), int(parts[2])))
             if time.time() > t_end:
                 log("  time limit reached while streaming ranks; using what was read")
                 break
             if not want and window and total >= window[1]:
                 break
+        else:
+            if progress is not None:
+                progress["complete"] = True
         r.close()
     except (requests.RequestException, zlib.error) as e:
         log(f"  Common Crawl ranks stream failed: {e}")
-    total = max(total, 1)
-    out = {d: {"cc_rank": hc, "cc_pr_rank": pr, "cc_authority": cc_authority(hc, total)} for d, (hc, pr) in found.items()}
+    if progress is not None:
+        progress["rows"] = total
+    out = {d: {"cc_rank": hc, "cc_pr_rank": pr, "cc_authority": cc_authority(hc, CC_TOTAL)} for d, (hc, pr) in found.items()}
     log(f"  {total:,} domains scanned, {len(out)} of {len(want)} candidates ranked")
     return out
 
@@ -2010,12 +2019,93 @@ def _merge(old, r, stamp):
     old[r["domain"]] = r
 
 
-def graph_scan(pairs, info, log, label):
+_TLD_NS, _TLD_LOCK = {}, threading.Lock()
+
+
+def tld_servers(zone, resolver):
+    """IPv4 addresses of a zone's own authoritative nameservers (e.g. a-m.gtld-servers.net for com)."""
+    with _TLD_LOCK:
+        if zone in _TLD_NS:
+            return _TLD_NS[zone]
+        ips = []
+        try:
+            for rr in list(resolver.resolve(zone + ".", "NS"))[:8]:
+                try:
+                    ips.append(next(iter(resolver.resolve(str(rr.target), "A"))).address)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+        _TLD_NS[zone] = ips
+        return ips
+
+
+def registry_dns_sweep(domains, qps=120, workers=48, max_seconds=900, log=lambda m: None):
+    """Ask each TLD's *own* nameservers whether a domain is delegated - the plain-sight trick for sweeping
+    hundreds of thousands of domains: public resolvers throttle bulk lookups, the registry servers answer
+    authoritatively in milliseconds. NXDOMAIN there = not registered (or on registry hold; RDAP decides).
+    Returns {domain: "nxdomain" | "unknown"} for everything that is NOT plainly delegated."""
+    import dns.message
+    import dns.query
+    import dns.rcode
+    import dns.rdatatype
+    res = make_resolver()
+    limiter = RateLimiter(1.0 / qps)
+    deadline = time.time() + max_seconds
+    done, lock, skipped = [0], threading.Lock(), [0]
+
+    def one(d):
+        if time.time() > deadline:
+            with lock:
+                skipped[0] += 1
+            return d, "skip"
+        zone = d.split(".", 1)[1] if "." in d else d
+        ips = tld_servers(zone, res)
+        if not ips:
+            return d, "unknown"
+        q = dns.message.make_query(d + ".", dns.rdatatype.NS)
+        st = "unknown"
+        for _ in range(2):
+            limiter.wait()
+            try:
+                r = dns.query.udp(q, random.choice(ips), timeout=3)
+            except Exception:  # noqa: BLE001
+                continue
+            if r.rcode() == dns.rcode.NXDOMAIN:
+                st = "nxdomain"
+                break
+            if r.rcode() == dns.rcode.NOERROR:
+                st = "delegated"
+                break
+        with lock:
+            done[0] += 1
+            if done[0] % 20000 == 0:
+                log(f"    registry DNS {done[0]:,}/{len(domains):,}")
+        return d, st
+
+    with ThreadPoolExecutor(workers) as ex:
+        res_ = list(ex.map(one, domains))
+    if skipped[0]:
+        log(f"    registry sweep time cap: {skipped[0]:,} left for the next run")
+    return {d: st for d, st in res_ if st in ("nxdomain", "unknown")}
+
+
+def graph_scan(pairs, info, log, label, sweep="public", max_seconds=900, max_dead=4000):
     """pairs: domains in authority order. DNS sweep -> registry check -> candidate rows."""
     pairs = [d for d in pairs if d and registrable(d) == d and not RESTRICTED_RE.search(d) and d not in IGNORE_TARGETS
              and not SPAM_RE.search(d.split(".")[0])]  # big link-farm networks inflate Majestic ranks of spam names
     log(f"{label}: DNS sweep of {len(pairs):,} high-authority domains...")
-    dead = dns_sweep(pairs, log=log)
+    if sweep == "registry":
+        swept = registry_dns_sweep(pairs, max_seconds=max_seconds, log=log)
+        dead = {d: "nxdomain" for d, st in swept.items() if st == "nxdomain"}
+        unknown = [d for d, st in swept.items() if st == "unknown"][:3000]
+        if unknown:
+            log(f"  {len(unknown):,} without a registry answer - trying public resolvers")
+            dead.update(dns_sweep(unknown, log=log, max_seconds=240))
+        order = {d: i for i, d in enumerate(pairs)}
+        dead = dict(sorted(dead.items(), key=lambda kv: order.get(kv[0], 0))[:max_dead])
+    else:
+        dead = dns_sweep(pairs, log=log)
     log(f"  {len(dead):,} do not resolve; asking the registries...")
     recs = status_check(list(dead), rdap_all=True, workers=40, log=log) if dead else {}
     cands = {d: r for d, r in recs.items() if r["status"] != "REGISTERED"}
@@ -2046,7 +2136,7 @@ def graph_scan(pairs, info, log, label):
 def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_minutes=40, sites=100,
          wiki_months=2, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=6000,
          seed=None, hn_months=4, debian_sample=1500, cordis_sample=1500, cc_ranks=True,
-         sd_pages=0, majestic_batch=0, cc_batch=0, wayback_checks=800, wikidata_types=8,
+         sd_pages=0, majestic_batch=0, cc_batch=150000, sweep_minutes=15, wayback_checks=800, wikidata_types=8,
          publisher_sites=9, wikidata_old=3000, dmoz_sample=3000, resource_domains=4, watch_top=1500, log=print):
     """Fully automatic run.
     Authority-first: StableDomains quality drop feed, a rotating batch of the Majestic Million and of the
@@ -2105,6 +2195,30 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
         log(f"Watchlist: checking {len(watch)} dead-site / expiring domains for drops...")
         recheck(watch)
         checkpoint("watchlist")
+
+    # 0b. web-graph sweep: dead domains the whole web still links to (Common Crawl ranks x registry DNS)
+    if cc_batch and time_left("web-graph sweep"):
+        start = cursors.get("cc", 0)
+        win, known = [], set(old)
+
+        def keep(d):
+            return (registrable(d) == d and d not in known and d not in IGNORE_TARGETS and not RESTRICTED_RE.search(d)
+                    and not SPAM_RE.search(d.split(".")[0]))
+        log(f"Web-graph sweep: Common Crawl ranks {start + 1:,}-{start + cc_batch:,}...")
+        prog = {}
+        cc_web_ranks([], log=log, window=(start, start + cc_batch), window_out=win, window_filter=keep,
+                     max_seconds=600, progress=prog)
+        info = {d: {"cc_rank": hc, "cc_pr_rank": pr, "cc_authority": cc_authority(hc)} for d, hc, pr in win}
+        cands = graph_scan([d for d, _, _ in win], info, log, "Web-graph sweep", sweep="registry",
+                           max_seconds=sweep_minutes * 60) if win else {}
+        for r in graph_rows(cands, "commoncrawl", info, stamp):
+            _merge(old, r, stamp)
+        by_source["commoncrawl"] = len(cands)
+        if win or prog.get("rows", 0) > start:
+            cursors["cc"] = start + cc_batch
+        elif prog.get("rows", 0) > 0:  # walked past the end of the file: start again from the top
+            cursors["cc"] = 0
+        checkpoint("web-graph sweep")
 
     # 1. StableDomains quality feed
     if sd_pages:
@@ -2190,27 +2304,17 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     # 5. Common Crawl: authority for every candidate + a rotating window of top-ranked domains to scan
     if cc_ranks and time_left("Common Crawl"):
         need = [d for d, r in old.items() if r.get("status") != "TAKEN" and r.get("cc_rank") in (None,)]
-        start = cursors.get("cc", 0)
-        window = (start, start + cc_batch) if cc_batch else None
-        win = []
-        log(f"Common Crawl web graph: authority for {len(need)} domains"
-            + (f", scanning ranks {start + 1:,}-{start + cc_batch:,}" if window else "") + "...")
-        found = cc_web_ranks(need, log=log, window=window, window_out=win,
-                             max_seconds=max(120, min(1200, hard_stop - time.time() - 300)))
+        log(f"Common Crawl web graph: authority for {len(need)} domains...")
+        prog = {}
+        found = cc_web_ranks(need, log=log, progress=prog,
+                             max_seconds=max(180, min(1500, hard_stop - time.time() - 240)))
         for d, inf in found.items():
             old[d].update(inf)
-        for d in need:
-            old[d].setdefault("cc_rank", "")
-        if window:
-            cursors["cc"] = start + cc_batch if win else 0
-            info = {}
-            total_est = 1.2e8
-            for d, hc, pr in win:
-                info[d] = {"cc_rank": hc, "cc_pr_rank": pr, "cc_authority": cc_authority(hc, total_est)}
-            cands = graph_scan([d for d, _, _ in win], info, log, "Common Crawl top ranks") if time_left("Common Crawl scan") else {}
-            for r in graph_rows(cands, "commoncrawl", info, stamp):
-                _merge(old, r, stamp)
-            by_source["commoncrawl"] = len(cands)
+        if prog.get("complete"):  # read the whole file: anything missing has no links at all in the graph
+            for d in need:
+                old[d].setdefault("cc_rank", "")
+        else:
+            log(f"  stream stopped after {prog.get('rows', 0):,} ranks; unranked domains will be retried")
 
     # anchor value estimates to StableDomains' own (free) estimate for the most promising candidates
     top = sorted((r for r in old.values() if r.get("status") in ("AVAILABLE", "LIKELY_AVAILABLE", "PENDING_DELETE",
@@ -2228,6 +2332,8 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
             time.sleep(0.4)
         log(f"  {got} estimates received")
     for r in old.values():
+        if str(r.get("cc_rank") or "").isdigit():  # one fixed scale (older runs used a varying one)
+            r["cc_authority"] = cc_authority(int(r["cc_rank"]))
         r["est_value"] = estimate_value(r)
         r["reg_price"] = reg_price(r)
         r["value_ratio"] = value_ratio(r)
@@ -2419,7 +2525,7 @@ def main():
     k.add_argument("--no-cc-ranks", action="store_true", help="skip the Common Crawl authority lookup")
     k.add_argument("--sd-pages", type=int, default=0, help="pages (25 rows) of the StableDomains quality feed")
     k.add_argument("--majestic", type=int, default=0, help="Majestic Million domains to DNS-scan per run")
-    k.add_argument("--cc-batch", type=int, default=0, help="top Common Crawl domains to DNS-scan per run")
+    k.add_argument("--cc-batch", type=int, default=150000, help="top Common Crawl domains to DNS-scan per run")
     k.add_argument("--wayback-checks", type=int, default=800, help="candidates to verify in the Wayback Machine")
     k.add_argument("--wikidata-types", type=int, default=8, help="random kinds of defunct organisations to read")
     k.add_argument("--wikidata-old", type=int, default=3000, help="former official websites to read from Wikidata")
