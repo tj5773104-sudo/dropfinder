@@ -2183,6 +2183,62 @@ def collect_wordpress(out_path, session=None, log=print, max_pages=400):
     return len(keep)
 
 
+def collect_coingecko(out_path, session=None, log=print, max_minutes=60, pause=4.0):
+    """Homepages of delisted ('inactive') crypto projects from CoinGecko's free API. The 2017-2021 token boom
+    produced thousands of project sites that collected press, exchange and forum links, then died.
+    Detail calls are rate-limited, so this resumes where the previous weekly run stopped."""
+    s = session or requests.Session()
+    s.headers.update({"User-Agent": UA, "Accept": "application/json"})
+    base = "https://api.coingecko.com/api/v3"
+    done_path = out_path.replace(".tsv.gz", "_done.tsv.gz")
+    rows = read_list(out_path)
+    done = {r[0] for r in read_list(done_path)}
+    try:
+        coins = s.get(f"{base}/coins/list", params={"status": "inactive"}, timeout=60).json()
+        if not isinstance(coins, list):
+            raise ValueError(str(coins)[:120])
+    except (requests.RequestException, ValueError) as e:
+        log(f"  CoinGecko inactive list failed: {e}")
+        return len(rows)
+    todo = [c for c in coins if c.get("id") and c["id"] not in done]
+    log(f"  CoinGecko: {len(coins):,} delisted coins, {len(todo):,} not looked up yet")
+    t_end, got = time.time() + max_minutes * 60, 0
+    for c in todo:
+        if time.time() > t_end:
+            break
+        cid = c["id"]
+        try:
+            r = s.get(f"{base}/coins/{cid}", timeout=30, params={
+                "localization": "false", "tickers": "false", "market_data": "false",
+                "community_data": "false", "developer_data": "false", "sparkline": "false"})
+            if r.status_code == 429:
+                time.sleep(70)
+                continue
+            j = r.json() if r.status_code == 200 else {}
+        except (requests.RequestException, ValueError):
+            time.sleep(pause)
+            continue
+        done.add(cid)
+        for u in ((j.get("links") or {}).get("homepage") or [])[:2]:
+            try:
+                d = registrable(urlparse(u).hostname or "") if u else ""
+            except ValueError:
+                d = ""
+            if d and d not in CODE_HOSTS and d not in IGNORE_TARGETS and d not in ("medium.com", "t.me", "linktr.ee"):
+                rows.append([d, cid, (c.get("name") or "").replace("\t", " "), (c.get("symbol") or "").upper()])
+                got += 1
+        time.sleep(pause)
+    seen, uniq = set(), []
+    for r in rows:
+        if r[0] not in seen:
+            seen.add(r[0])
+            uniq.append(r)
+    _write_list(out_path, ("\t".join(r) for r in uniq))
+    _write_list(done_path, sorted(done))
+    log(f"  CoinGecko: +{got} homepages this run, {len(uniq):,} dead-project domains in total -> {out_path}")
+    return len(uniq)
+
+
 def _write_list(path, lines):
     import gzip
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -2215,7 +2271,8 @@ def wiki_pages_linking(domain, session, limit=3):
     return out[:limit]
 
 
-def list_sweep_records(cursors, known, log=print, wiki_slice=40000, wp_slice=25000, sweep_seconds=600, lookups=300):
+def list_sweep_records(cursors, known, log=print, wiki_slice=40000, wp_slice=25000, sweep_seconds=600, lookups=300,
+                       crypto_slice=20000):
     """Take the next slice of each big list, keep domains the registry says don't exist, and turn them into
     normal link records (with a real page that links to them) for the usual status checks."""
     recs = []
@@ -2237,7 +2294,8 @@ def list_sweep_records(cursors, known, log=print, wiki_slice=40000, wp_slice=250
 
     wiki = take("wikicount", read_list(os.path.join(LIST_DIR, "wiki_cited.tsv.gz")), wiki_slice) if wiki_slice else []
     wp = take("wordpress", read_list(os.path.join(LIST_DIR, "wordpress.tsv.gz")), wp_slice) if wp_slice else []
-    doms = list(dict.fromkeys([r[0] for r in wiki] + [r[0] for r in wp]))
+    crypto = take("crypto", read_list(os.path.join(LIST_DIR, "coingecko.tsv.gz")), crypto_slice) if crypto_slice else []
+    doms = list(dict.fromkeys([r[0] for r in wiki] + [r[0] for r in wp] + [r[0] for r in crypto]))
     if not doms:
         return recs
     swept = registry_dns_sweep(doms, max_seconds=sweep_seconds, log=log)
@@ -2268,7 +2326,17 @@ def list_sweep_records(cursors, known, log=print, wiki_slice=40000, wp_slice=250
                    reason=f"WordPress {kind} author site")
         if rec:
             recs.append(rec)
-    log(f"  {len(recs):,} records from Wikipedia link counts and WordPress authors")
+    for r in crypto:
+        d = r[0]
+        if d not in swept or len(r) < 2:
+            continue
+        name = r[2] if len(r) > 2 else r[1]
+        sym = f" ({r[3]})" if len(r) > 3 and r[3] else ""
+        rec = _rec(f"https://www.coingecko.com/en/coins/{r[1]}", "coingecko.com", f"http://{d}/",
+                   f"{name}{sym} - delisted crypto project", "crypto", follow="", reason="dead crypto project")
+        if rec:
+            recs.append(rec)
+    log(f"  {len(recs):,} records from Wikipedia link counts, WordPress authors and dead crypto projects")
     return recs
 
 
@@ -2443,7 +2511,7 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
                       publisher_sites=publisher_sites, wikidata_old=wikidata_old, dmoz_sample=dmoz_sample,
                       resource_domains=resource_domains, log=log)
     for v in ("crawl", "wikipedia", "hackernews", "debian", "cordis", "wikidata", "publishers", "wikidata_old",
-              "dmoz", "resources", "press", "wikicount", "wordpress"):
+              "dmoz", "resources", "press", "wikicount", "wordpress", "crypto"):
         by_source[v + "_links"] = sum(1 for r in records if r.get("via") == v)
     log(f"Harvested {len(records)} links ({sum(r['follow'] == 'dofollow' for r in records)} dofollow) "
         f"to {len({r['target_domain'] for r in records})} domains.")
@@ -2729,9 +2797,11 @@ def main():
 
     co = sub.add_parser("collect", help="weekly: build the big domain lists (Wikipedia link counts, WordPress authors)")
     co.add_argument("--out", default=LIST_DIR)
-    co.add_argument("--only", choices=["wiki", "wordpress"], default=None)
-    co.set_defaults(fn=lambda a: [collect_wiki_cited(os.path.join(a.out, "wiki_cited.tsv.gz")) if a.only != "wordpress" else 0,
-                                  collect_wordpress(os.path.join(a.out, "wordpress.tsv.gz")) if a.only != "wiki" else 0])
+    co.add_argument("--only", choices=["wiki", "wordpress", "coingecko"], default=None)
+    co.set_defaults(fn=lambda a: [
+        collect_wiki_cited(os.path.join(a.out, "wiki_cited.tsv.gz")) if a.only in (None, "wiki") else 0,
+        collect_wordpress(os.path.join(a.out, "wordpress.tsv.gz")) if a.only in (None, "wordpress") else 0,
+        collect_coingecko(os.path.join(a.out, "coingecko.tsv.gz")) if a.only in (None, "coingecko") else 0])
     sub.add_parser("selftest", help="offline tests").set_defaults(fn=lambda a: selftest())
     args = ap.parse_args()
     args.fn(args)

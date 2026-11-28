@@ -416,7 +416,7 @@ footer{color:var(--m);font-size:12px;padding:8px 12px 20px}
 <script>
 const VIA={wikipedia:"Wikipedia",cordis:"EU research projects",wikidata:"Closed organisations",crawl:"Top websites",
   hackernews:"Hacker News",debian:"Debian packages",publishers:"News & gov archives",github:"GitHub",seed:"Your seeds",
-  commoncrawl:"Web-graph sweep",wikicount:"Wikipedia link counts",wordpress:"WordPress authors",wikidata_old:"Former official sites",dmoz:"DMOZ directory",resources:"Gov/edu links pages",press:"Press releases"};
+  commoncrawl:"Web-graph sweep",wikicount:"Wikipedia link counts",wordpress:"WordPress authors",crypto:"Dead crypto projects",wikidata_old:"Former official sites",dmoz:"DMOZ directory",resources:"Gov/edu links pages",press:"Press releases"};
 const ST={AVAILABLE:"Available",LIKELY_AVAILABLE:"Likely free",PENDING_DELETE:"Pending delete",REDEMPTION:"Redemption",
   EXPIRED_GRACE:"Expired (grace)",EXPIRING_SOON:"Expiring",DEAD_SITE:"Dead site",PARKED:"Parked"};
 const GROUP={buy:["AVAILABLE","LIKELY_AVAILABLE"],drop:["PENDING_DELETE","REDEMPTION","EXPIRED_GRACE","EXPIRING_SOON"],

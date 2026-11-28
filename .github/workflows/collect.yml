@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "wiki, wordpress, or blank for both"
+        description: "wiki, wordpress, coingecko, or blank for all"
         required: false
         default: ""
 
