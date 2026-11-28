@@ -389,6 +389,25 @@ a.buy{display:inline-block;padding:4px 10px;border-radius:6px;background:var(--a
 .pg button{font:inherit;padding:6px 12px;border:1px solid var(--b);border-radius:6px;background:#fff}
 .empty{padding:30px;text-align:center;color:var(--m)}
 footer{color:var(--m);font-size:12px;padding:8px 12px 20px}
+td.dom{max-width:230px;overflow:hidden;text-overflow:ellipsis}
+.dn{all:unset;cursor:pointer;display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-weight:600;color:var(--t);border-bottom:1px dashed #9aa6b6}.dn:focus-visible{outline:2px solid var(--a)}
+.mk{font-size:12px;margin-right:3px}tr.m-c td{opacity:.55}tr.m-c td.dom{opacity:1}tr.m-c .dn{color:var(--m)}
+#pop{position:fixed;z-index:20;width:360px;max-width:calc(100vw - 16px);max-height:min(560px,calc(100vh - 16px));overflow:auto;
+  background:#fff;border:1px solid var(--b);border-radius:10px;box-shadow:0 12px 32px rgba(16,24,40,.18);padding:12px 14px}
+#pop[hidden]{display:none}
+#pop .ph{display:flex;align-items:flex-start;gap:8px}#pop .pd{font-weight:700;font-size:16px;word-break:break-all;flex:1}
+#pop .x{border:0;background:none;font-size:20px;line-height:1;color:var(--m);cursor:pointer;padding:0 2px}
+#pop .facts{color:var(--m);font-size:12px;margin:4px 0 10px}#pop .facts b{color:var(--t);font-weight:600}
+#pop h4{margin:10px 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--m)}
+#pop .qc{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+#pop .qc a,#pop .qc button,#pop .marks button{font:inherit;font-size:13px;text-align:center;padding:7px 6px;border:1px solid var(--b);
+  border-radius:7px;background:#fff;color:var(--t);text-decoration:none;cursor:pointer}
+#pop .qc a:hover,#pop .marks button:hover{background:#f2f5fa}
+#pop .marks{display:flex;gap:6px}#pop .marks button{flex:1}#pop .marks button.on{background:#e8effc;border-color:var(--a);color:var(--a);font-weight:600}
+#pop .src div{margin-bottom:6px}#pop .src a{word-break:break-all}#pop a.buy{display:block;text-align:center;margin-top:10px;padding:8px}
+@media(max-width:900px){td.dom{max-width:135px}td.src{max-width:220px}th{letter-spacing:0}}
+@media(max-width:700px){#pop{left:0!important;right:0;bottom:0;top:auto!important;width:auto;max-width:none;border-radius:14px 14px 0 0;max-height:75vh}}
 </style></head><body>
 <header><h1>Drop<span>Finder</span></h1><span class="sub">Expired &amp; available domains that real web pages still link to. Updated automatically.</span></header>
 <div class="bar">
@@ -400,17 +419,19 @@ footer{color:var(--m);font-size:12px;padding:8px 12px 20px}
   <select id="via"><option value="">All sources</option></select>
   <select id="tld"><option value="">All TLDs</option></select>
   <select id="au"><option value="1">Authority 1+</option><option value="3">Strong only (3+)</option><option value="0">Any authority</option></select>
+  <select id="mk"><option value="">All (except hidden)</option><option value="s">&#9733; My shortlist</option><option value="u">Not checked yet</option><option value="c">&#10003; Checked</option><option value="h">Hidden</option></select>
   <label><input type="checkbox" id="dfo"> Dofollow only</label>
   <label><input type="checkbox" id="nospam" checked> Hide spam</label>
 </div>
-<div class="info"><span id="count">Loading...</span><span><span id="upd"></span> &middot; <a href="/feed.csv">CSV</a> &middot; <a href="/drops.rss">Drop alerts (RSS)</a></span></div>
+<div class="info"><span><span id="count">Loading...</span> &middot; tap a domain for quick checks</span><span><span id="upd"></span> &middot; <a href="/feed.csv">CSV</a> &middot; <a href="/drops.rss">Drop alerts (RSS)</a></span></div>
 <div class="wrap"><table>
 <thead><tr>
-  <th data-k="d">Domain</th><th class="ns">Linked from &ndash; tap to see the link</th><th data-k="n">Links</th>
+  <th data-k="d">Domain</th><th class="ns">Linked from</th><th data-k="n">Links</th>
   <th data-k="au" title="How strongly the whole web links to this domain (Common Crawl web graph), 0-10">Authority</th>
   <th data-k="y">Since</th><th data-k="q">Quality</th><th data-k="v">Value</th>
   <th data-k="st">Status</th><th data-k="found" class="opt">Found</th>
 </tr></thead><tbody id="rows"></tbody></table></div>
+<div id="pop" hidden role="dialog" aria-label="Domain details"></div>
 <div class="pg"><button id="prev">&lsaquo; Prev</button><span id="pno"></span><button id="next">Next &rsaquo;</button></div>
 <footer>Est. value is a rough guide from link and history signals, not an appraisal. Authority (0-10) is how strongly the whole web links to the domain, from the Common Crawl web graph. Quality (0-100) weighs real-site history, dofollow links and authority. Always check a domain's history before buying.</footer>
 <script>
@@ -422,6 +443,10 @@ const ST={AVAILABLE:"Available",LIKELY_AVAILABLE:"Likely free",PENDING_DELETE:"P
 const GROUP={buy:["AVAILABLE","LIKELY_AVAILABLE"],drop:["PENDING_DELETE","REDEMPTION","EXPIRED_GRACE","EXPIRING_SOON"],
   dead:["DEAD_SITE","PARKED"]};
 const SO={AVAILABLE:0,LIKELY_AVAILABLE:1,PENDING_DELETE:2,REDEMPTION:3,EXPIRED_GRACE:4,EXPIRING_SOON:5,DEAD_SITE:6,PARKED:7};
+let MARKS={};try{MARKS=JSON.parse(localStorage.getItem("df-marks")||"{}")}catch(e){}
+const mk=d=>MARKS[d]||{};
+function setMark(d,k){const m={...mk(d)};m[k]=!m[k];if(!m[k])delete m[k];if(Object.keys(m).length)MARKS[d]=m;else delete MARKS[d];
+  try{localStorage.setItem("df-marks",JSON.stringify(MARKS))}catch(e){}}
 const PER=100; let BUY="", ALL=[], VIEW=[], page=0, sortK="au", asc=false;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -436,8 +461,8 @@ function srcHtml(s){if(!safe(s.u))return"";
   return `<div><a href="${esc(jump(s))}" target="_blank" rel="noopener nofollow">${esc(p.length>70?p.slice(0,70)+"…":p)}</a>
   <span class="tag ${s.f==="dofollow"?"df":"nf"}">${s.f==="dofollow"?"dofollow":s.f||"link"}</span>
   ${s.a?`<span class="anc">“${esc(s.a)}”</span>`:""}</div>`;}
-function row(r,i){const extra=r.s.length-1;
-  return `<tr><td class="dom">${esc(r.d)}</td>
+function row(r,i){const extra=r.s.length-1,m=mk(r.d);
+  return `<tr class="${m.c?"m-c":""}"><td class="dom"><button class="dn" data-i="${i}" title="${esc(r.d)}">${m.s?'<span class="mk">&#9733;</span>':""}${m.c?'<span class="mk">&#10003;</span>':""}${esc(r.d)}</button></td>
   <td class="src">${srcHtml(r.s[0])}${extra>0?`<div class="x" hidden>${r.s.slice(1).map(srcHtml).join("")}</div>
    <button class="more" data-i="${i}">+${extra} more page${extra>1?"s":""}</button>`:""}
    <span class="anc">${esc(VIA[r.via]||r.via)}</span></td>
@@ -446,11 +471,12 @@ function row(r,i){const extra=r.s.length-1;
   <td class="num">${r.v?"$"+Number(r.v).toLocaleString():"-"}</td>
   <td class="stc"><span class="s-${r.st}">${ST[r.st]||r.st}</span>${r.drop?`<span class="tag new" title="Was: ${esc(ST[r.was]||r.was)}">Dropped ${r.drop.slice(5)}</span>`:""}${["AVAILABLE","LIKELY_AVAILABLE"].includes(r.st)&&BUY?`<a class="buy" href="${esc(BUY.replace("DOMAIN",encodeURIComponent(r.d)))}" target="_blank" rel="noopener">Register</a>`:""}</td>
   <td class="num opt">${r.found}</td></tr>`;}
-function apply(){const q=$("q").value.trim().toLowerCase(),g=$("st").value,via=$("via").value,tld=$("tld").value,
-  dfo=$("dfo").checked,ns=$("nospam").checked,amin=+$("au").value;
+function apply(){closePop();const q=$("q").value.trim().toLowerCase(),g=$("st").value,via=$("via").value,tld=$("tld").value,
+  dfo=$("dfo").checked,ns=$("nospam").checked,amin=+$("au").value,mv=$("mk").value;
   const cut=new Date(Date.now()-14*864e5).toISOString().slice(0,10);
   VIEW=ALL.filter(r=>(g==="all"||(g==="new"?r.drop>=cut:GROUP[g].includes(r.st)))&&(!via||r.s.some(s=>s.via===via))&&(!tld||r.tld===tld)
     &&(!dfo||r.df>0||r.n===0)&&(!ns||!r.spam)&&r.au>=amin
+    &&(()=>{const m=mk(r.d);return mv===""?!m.h:mv==="u"?!m.c&&!m.h:!!m[mv]})()
     &&(!q||r.d.includes(q)||r.s.some(s=>s.u.toLowerCase().includes(q)||s.a.toLowerCase().includes(q))));
   const k=sortK,m=asc?1:-1;
   VIEW.sort((a,b)=>{let x=a[k],y=b[k];if(k==="y"){const z=asc?"9999":"0000";x=x||z;y=y||z}
@@ -464,9 +490,9 @@ function render(){const n=VIEW.length,pages=Math.max(1,Math.ceil(n/PER));page=Ma
   $("count").textContent=`${n.toLocaleString()} domains (of ${ALL.length.toLocaleString()})`;
   $("pno").textContent=`Page ${page+1} of ${pages}`;$("prev").disabled=page===0;$("next").disabled=page>=pages-1;
   document.querySelectorAll("th[data-k]").forEach(th=>{th.classList.toggle("on",th.dataset.k===sortK);th.classList.toggle("asc",th.dataset.k===sortK&&asc)});}
-function save(){try{localStorage.setItem("df-t2",JSON.stringify({st:$("st").value,via:$("via").value,tld:$("tld").value,au:$("au").value,
+function save(){try{localStorage.setItem("df-t2",JSON.stringify({mk:$("mk").value,st:$("st").value,via:$("via").value,tld:$("tld").value,au:$("au").value,
   dfo:$("dfo").checked,ns:$("nospam").checked,k:sortK,asc}))}catch(e){}}
-function restore(){try{const o=JSON.parse(localStorage.getItem("df-t2")||"{}");if(o.st)$("st").value=o.st;if(o.au)$("au").value=o.au;
+function restore(){try{const o=JSON.parse(localStorage.getItem("df-t2")||"{}");if(o.st)$("st").value=o.st;if(o.mk)$("mk").value=o.mk;if(o.au)$("au").value=o.au;
   if(o.via)$("via").value=o.via;if(o.tld)$("tld").value=o.tld;$("dfo").checked=!!o.dfo;if(o.ns===false)$("nospam").checked=false;
   if(o.k){sortK=o.k;asc=!!o.asc}}catch(e){}}
 function fill(sel,counts,label){Object.entries(counts).sort((a,b)=>b[1]-a[1]).forEach(([k,c])=>{
@@ -476,13 +502,54 @@ document.querySelector("thead").addEventListener("click",e=>{const th=e.target.c
 $("rows").addEventListener("click",e=>{const b=e.target.closest(".more");if(!b)return;const x=b.previousElementSibling;
   x.hidden=!x.hidden;b.textContent=x.hidden?b.dataset.t:"Show less";});
 document.addEventListener("click",e=>{const b=e.target.closest(".more");if(b&&!b.dataset.t)b.dataset.t=b.textContent},true);
-["q","st","via","tld","au","dfo","nospam"].forEach(id=>$(id).addEventListener(id==="q"?"input":"change",apply));
-$("prev").onclick=()=>{page--;render();scrollTo(0,0)};$("next").onclick=()=>{page++;render();scrollTo(0,0)};
+["q","st","via","tld","au","mk","dfo","nospam"].forEach(id=>$(id).addEventListener(id==="q"?"input":"change",apply));
+let popI=-1,popPinned=false,hoverT=0;
+function qlinks(d){const e=encodeURIComponent;return [
+  ["Google mentions","https://www.google.com/search?q="+e('"'+d+'"')],["Google site:","https://www.google.com/search?q="+e("site:"+d)],
+  ["Wayback history","https://web.archive.org/web/*/"+d+"*"],["Backlinks (Ahrefs)","https://ahrefs.com/backlink-checker/?input="+e(d)+"&mode=subdomains"],
+  ["Backlinks (Majestic)","https://majestic.com/reports/site-explorer?q="+e(d)+"&IndexDataSource=F"],["Owner / expiry","https://lookup.icann.org/en/lookup?name="+e(d)]];}
+function openPop(i,cell,pin){const r=VIEW[i];if(!r)return;popI=i;popPinned=!!pin;const m=mk(r.d),P=$("pop");
+  const buy=["AVAILABLE","LIKELY_AVAILABLE"].includes(r.st)&&BUY;
+  P.innerHTML=`<div class="ph"><div class="pd">${esc(r.d)}</div><button class="x" data-act="close" aria-label="Close">&times;</button></div>
+  <div class="facts"><b class="s-${r.st}">${ST[r.st]||r.st}</b>${r.drop?` &middot; dropped ${r.drop}`:""} &middot; Authority <b>${r.au?r.au.toFixed(1):"-"}</b>
+   &middot; Quality <b>${r.q}</b> &middot; Since <b>${r.y||"-"}</b> &middot; Value <b>${r.v?"$"+Number(r.v).toLocaleString():"-"}</b></div>
+  <div class="marks"><button data-act="s" class="${m.s?"on":""}">&#9733; Shortlist</button><button data-act="c" class="${m.c?"on":""}">&#10003; Checked</button><button data-act="h" class="${m.h?"on":""}">&#10005; Hide</button></div>
+  <h4>Check it</h4><div class="qc">${qlinks(r.d).map(([t,u])=>`<a href="${esc(u)}" target="_blank" rel="noopener nofollow">${t}</a>`).join("")}
+   <button data-act="copy">Copy domain</button></div>
+  <h4>Linked from</h4><div class="src">${r.s.map(srcHtml).join("")}</div>
+  ${buy?`<a class="buy" href="${esc(BUY.replace("DOMAIN",encodeURIComponent(r.d)))}" target="_blank" rel="noopener">Register ${esc(r.d)}</a>`:""}`;
+  P.hidden=false;
+  if(innerWidth>700&&cell){const b=cell.getBoundingClientRect(),w=P.offsetWidth,h=P.offsetHeight;
+    let x=b.left,y=b.bottom+6;if(x+w>innerWidth-8)x=innerWidth-8-w;if(y+h>innerHeight-8)y=Math.max(8,b.top-h-6);
+    P.style.left=Math.max(8,x)+"px";P.style.top=y+"px";}}
+function closePop(){$("pop").hidden=true;popI=-1;popPinned=false;}
+$("rows").addEventListener("click",e=>{const b=e.target.closest(".dn");if(!b)return;e.stopPropagation();
+  const i=+b.dataset.i;if(popI===i&&popPinned){closePop();return}openPop(i,b.closest("td"),true);});
+const canHover=matchMedia("(hover:hover) and (pointer:fine)").matches;
+if(canHover){$("rows").addEventListener("mouseover",e=>{const b=e.target.closest(".dn");if(!b||popPinned)return;
+    clearTimeout(hoverT);hoverT=setTimeout(()=>openPop(+b.dataset.i,b.closest("td"),false),350);});
+  $("rows").addEventListener("mouseout",e=>{if(e.target.closest(".dn")&&!popPinned){clearTimeout(hoverT);hoverT=setTimeout(()=>{if(!popPinned&&!$("pop").matches(":hover"))closePop()},300)}});
+  $("pop").addEventListener("mouseleave",()=>{if(!popPinned){hoverT=setTimeout(closePop,300)}});
+  $("pop").addEventListener("mouseenter",()=>clearTimeout(hoverT));}
+$("pop").addEventListener("click",e=>{const b=e.target.closest("[data-act]");if(!b){popPinned=true;return}const r=VIEW[popI],a=b.dataset.act;
+  if(a==="close"){closePop();return}
+  if(a==="copy"){const done=()=>{b.textContent="Copied";setTimeout(()=>b.textContent="Copy domain",1200)};
+    (navigator.clipboard?navigator.clipboard.writeText(r.d):Promise.reject()).then(done).catch(()=>{const t=document.createElement("textarea");t.value=r.d;
+    document.body.appendChild(t);t.select();try{document.execCommand("copy");done()}catch(_){}t.remove()});return}
+  setMark(r.d,a);b.classList.toggle("on",!!mk(r.d)[a]);popPinned=true;
+  const keep=popI;const tr=document.querySelector(`.dn[data-i="${keep}"]`);if(tr){const m=mk(r.d);
+    tr.innerHTML=(m.s?'<span class="mk">&#9733;</span>':"")+(m.c?'<span class="mk">&#10003;</span>':"")+esc(r.d);tr.closest("tr").classList.toggle("m-c",!!m.c);
+    if(a==="h"&&m.h)tr.closest("tr").style.display="none";}});
+document.addEventListener("click",e=>{if(!$("pop").hidden&&!e.target.closest("#pop")&&!e.target.closest(".dn"))closePop()});
+document.addEventListener("keydown",e=>{if(e.key==="Escape")closePop()});
+addEventListener("scroll",()=>{if(!$("pop").hidden&&innerWidth>700&&!popPinned)closePop()},{passive:true});
+$("prev").onclick=()=>{closePop();page--;render();scrollTo(0,0)};$("next").onclick=()=>{closePop();page++;render();scrollTo(0,0)};
 fetch("/table.json").then(r=>r.json()).then(j=>{ALL=j.rows||[];BUY=j.buy||"";
   const v={},t={};ALL.forEach(r=>{new Set(r.s.map(s=>s.via)).forEach(x=>{if(x)v[x]=(v[x]||0)+1});t[r.tld]=(t[r.tld]||0)+1});
   fill("via",v,k=>VIA[k]||k);fill("tld",t,k=>"."+k);restore();
   if(j.updated)$("upd").textContent="Updated "+new Date(j.updated).toLocaleString([], {dateStyle:"medium",timeStyle:"short"});
-  apply();}).catch(()=>{$("count").textContent="Couldn't load the data - please refresh."});
+  apply();if(location.hash==="#demo-pop"){const b=document.querySelector(".dn");if(b)openPop(+b.dataset.i,b.closest("td"),true)}
+  }).catch(()=>{$("count").textContent="Couldn't load the data - please refresh."});
 </script></body></html>"""
 
 
