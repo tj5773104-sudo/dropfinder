@@ -15,6 +15,7 @@ import uuid
 from urllib.parse import urlparse
 
 import requests
+from datetime import datetime
 from flask import Flask, Response, abort, jsonify, redirect, render_template_string, request, url_for
 
 import dropfinder as df
@@ -312,6 +313,7 @@ def table_rows():
             "df": sum(1 for s in src if s.get("follow") == "dofollow"),
             "via": src[0].get("via") or "", "found": (r.get("first_seen") or "")[:10],
             "spam": bool(df.SPAM_RE.search(d.split(".")[0])),
+            "drop": (r.get("dropped_at") or "")[:10], "was": r.get("prev_status") or "",
             "s": [{"u": s["url"], "a": (s.get("anchor") or "")[:120], "f": s.get("follow") or "",
                    "via": s.get("via") or ""} for s in src[:5]],
         })
@@ -326,6 +328,23 @@ def table_json():
     resp = jsonify(updated=f["updated"], buy=df.buy_url("DOMAIN"), rows=table_rows())
     resp.headers["Cache-Control"] = "public, max-age=120"
     return resp
+
+
+@app.get("/drops.rss")
+def drops_rss():
+    """Watched domains that just dropped / became registrable - subscribe in any RSS reader for alerts."""
+    from xml.sax.saxutils import escape as x
+    rows = sorted((r for r in table_rows() if r["drop"]), key=lambda r: r["drop"], reverse=True)[:100]
+    items = "".join(
+        f"<item><title>{x(r['d'])} - {x(r['st'].replace('_', ' ').lower())}</title>"
+        f"<link>{x(df.buy_url(r['d']))}</link><guid isPermaLink=\"false\">{x(r['d'] + r['drop'])}</guid>"
+        f"<description>{x('Was ' + r['was'].replace('_', ' ').lower() + '. Linked from ' + r['s'][0]['u'])}</description>"
+        f"<pubDate>{datetime.strptime(r['drop'], '%Y-%m-%d').strftime('%a, %d %b %Y 06:00:00 +0000')}</pubDate></item>"
+        for r in rows)
+    body = ('<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>DropFinder - just dropped</title>'
+            f"<link>{x(request.url_root)}</link><description>Backlinked domains that just dropped</description>{items}"
+            "</channel></rss>")
+    return Response(body, mimetype="application/rss+xml")
 
 
 TABLE_PAGE = r"""<!doctype html>
@@ -356,7 +375,7 @@ td.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
 .src a{color:var(--a);text-decoration:none;word-break:break-all}.src a:hover{text-decoration:underline}
 .anc{color:var(--m);font-size:12px;display:block}.more{border:0;background:none;color:var(--a);padding:0;font:inherit;font-size:12px;cursor:pointer}
 .tag{display:inline-block;font-size:11px;padding:1px 6px;border-radius:9px;background:#eef2f7;color:#3b4656;white-space:nowrap}
-.df{background:#e6f4ea;color:var(--g)}.nf{background:#f3f4f6;color:var(--m)}
+.df{background:#e6f4ea;color:var(--g)}.new{display:block;width:max-content;margin-top:3px;background:#fff4e5;color:var(--o)}.nf{background:#f3f4f6;color:var(--m)}
 .s-AVAILABLE,.s-LIKELY_AVAILABLE{color:var(--g);font-weight:600}.s-PENDING_DELETE,.s-REDEMPTION,.s-EXPIRED_GRACE,.s-EXPIRING_SOON{color:var(--o);font-weight:600}
 .s-DEAD_SITE,.s-PARKED{color:var(--m)}
 a.buy{display:inline-block;padding:4px 10px;border-radius:6px;background:var(--a);color:#fff;text-decoration:none;font-size:13px;white-space:nowrap}
@@ -369,7 +388,7 @@ footer{color:var(--m);font-size:12px;padding:8px 12px 20px}
 <div class="bar">
   <input type="search" id="q" placeholder="Search domain, linking page or anchor">
   <select id="st">
-    <option value="buy">Can register now</option><option value="drop">Dropping soon</option>
+    <option value="buy">Can register now</option><option value="new">Just dropped (14 days)</option><option value="drop">Dropping soon</option>
     <option value="all">All statuses</option><option value="dead">Dead site (still registered)</option>
   </select>
   <select id="via"><option value="">All sources</option></select>
@@ -377,7 +396,7 @@ footer{color:var(--m);font-size:12px;padding:8px 12px 20px}
   <label><input type="checkbox" id="dfo"> Dofollow only</label>
   <label><input type="checkbox" id="nospam" checked> Hide spam</label>
 </div>
-<div class="info"><span id="count">Loading...</span><span><span id="upd"></span> &middot; <a href="/feed.csv">CSV</a></span></div>
+<div class="info"><span id="count">Loading...</span><span><span id="upd"></span> &middot; <a href="/feed.csv">CSV</a> &middot; <a href="/drops.rss">Drop alerts (RSS)</a></span></div>
 <div class="wrap"><table>
 <thead><tr>
   <th data-k="d">Domain</th><th class="ns">Linked from &ndash; tap to see the link</th><th data-k="n">Links</th>
@@ -388,7 +407,8 @@ footer{color:var(--m);font-size:12px;padding:8px 12px 20px}
 <footer>Est. value is a rough guide from link and history signals, not an appraisal. Quality (0-100) weighs real-site history, dofollow links and the linking site's authority. Always check a domain's history before buying.</footer>
 <script>
 const VIA={wikipedia:"Wikipedia",cordis:"EU research projects",wikidata:"Closed organisations",crawl:"Top websites",
-  hackernews:"Hacker News",debian:"Debian packages",publishers:"News & gov archives",github:"GitHub",seed:"Your seeds"};
+  hackernews:"Hacker News",debian:"Debian packages",publishers:"News & gov archives",github:"GitHub",seed:"Your seeds",
+  wikidata_old:"Former official sites",dmoz:"DMOZ directory",resources:"Gov/edu links pages",press:"Press releases"};
 const ST={AVAILABLE:"Available",LIKELY_AVAILABLE:"Likely free",PENDING_DELETE:"Pending delete",REDEMPTION:"Redemption",
   EXPIRED_GRACE:"Expired (grace)",EXPIRING_SOON:"Expiring",DEAD_SITE:"Dead site",PARKED:"Parked"};
 const GROUP={buy:["AVAILABLE","LIKELY_AVAILABLE"],drop:["PENDING_DELETE","REDEMPTION","EXPIRED_GRACE","EXPIRING_SOON"],
@@ -415,11 +435,12 @@ function row(r,i){const extra=r.s.length-1;
   <td class="num">${r.n}</td>
   <td class="num">${r.y||"-"}</td><td class="num">${r.q}</td>
   <td class="num">${r.v?"$"+Number(r.v).toLocaleString():"-"}</td>
-  <td class="stc"><span class="s-${r.st}">${ST[r.st]||r.st}</span>${["AVAILABLE","LIKELY_AVAILABLE"].includes(r.st)&&BUY?`<a class="buy" href="${esc(BUY.replace("DOMAIN",encodeURIComponent(r.d)))}" target="_blank" rel="noopener">Register</a>`:""}</td>
+  <td class="stc"><span class="s-${r.st}">${ST[r.st]||r.st}</span>${r.drop?`<span class="tag new" title="Was: ${esc(ST[r.was]||r.was)}">Dropped ${r.drop.slice(5)}</span>`:""}${["AVAILABLE","LIKELY_AVAILABLE"].includes(r.st)&&BUY?`<a class="buy" href="${esc(BUY.replace("DOMAIN",encodeURIComponent(r.d)))}" target="_blank" rel="noopener">Register</a>`:""}</td>
   <td class="num opt">${r.found}</td></tr>`;}
 function apply(){const q=$("q").value.trim().toLowerCase(),g=$("st").value,via=$("via").value,tld=$("tld").value,
   dfo=$("dfo").checked,ns=$("nospam").checked;
-  VIEW=ALL.filter(r=>(g==="all"||GROUP[g].includes(r.st))&&(!via||r.s.some(s=>s.via===via))&&(!tld||r.tld===tld)
+  const cut=new Date(Date.now()-14*864e5).toISOString().slice(0,10);
+  VIEW=ALL.filter(r=>(g==="all"||(g==="new"?r.drop>=cut:GROUP[g].includes(r.st)))&&(!via||r.s.some(s=>s.via===via))&&(!tld||r.tld===tld)
     &&(!dfo||r.df>0)&&(!ns||!r.spam)
     &&(!q||r.d.includes(q)||r.s.some(s=>s.u.toLowerCase().includes(q)||s.a.toLowerCase().includes(q))));
   const k=sortK,m=asc?1:-1;

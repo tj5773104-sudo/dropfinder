@@ -42,6 +42,7 @@ import threading
 import time
 import urllib.robotparser
 import zipfile
+import zlib
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -982,6 +983,175 @@ def wikidata_defunct(per_type=3000, types=None, session=None, rng=random, log=la
     return out
 
 
+# ---- old official websites of notable organisations (rebrands, moves) -------------------------
+def wikidata_old_websites(limit=3000, min_sitelinks=6, session=None, rng=random, log=lambda m: None):
+    """Former official websites from Wikidata: P856 statements with an end date (P582) or deprecated rank, on
+    items notable enough to have several Wikipedia articles. When an organisation rebrands or moves, the old
+    domain sometimes lapses while years of press, Wikipedia and .edu links still point at it."""
+    s = session or requests.Session()
+    s.headers.update({"User-Agent": UA, "Accept": "application/sparql-results+json"})
+    queries = {
+        "ended": "?st pq:P582 ?end .",
+        "deprecated": "?st wikibase:rank wikibase:DeprecatedRank .",
+    }
+    out, seen = [], set()
+    for kind, cond in queries.items():
+        off = rng.choice([0, 0, limit, 2 * limit])
+        q = ("SELECT ?item ?itemLabel ?site ?end ?links WHERE { ?item p:P856 ?st . ?st ps:P856 ?site . %s "
+             "?item wikibase:sitelinks ?links . FILTER(?links >= %d) "
+             "SERVICE wikibase:label { bd:serviceParam wikibase:language \"en\" } } LIMIT %d OFFSET %d"
+             % (cond, min_sitelinks, limit, off))
+        try:
+            r = s.get("https://query.wikidata.org/sparql", params={"query": q, "format": "json"}, timeout=90)
+            rows = r.json()["results"]["bindings"]
+        except (requests.RequestException, ValueError, KeyError) as e:
+            log(f"  Wikidata old websites ({kind}): failed ({type(e).__name__})")
+            continue
+        n0 = len(out)
+        for b in rows:
+            site = b.get("site", {}).get("value", "")
+            name = b.get("itemLabel", {}).get("value", "")
+            end = b.get("end", {}).get("value", "")[:4]
+            links = b.get("links", {}).get("value", "")
+            anchor = f"{name} - former official website" + (f" (until {end})" if end else "")
+            item = b.get("item", {}).get("value", "").replace("/entity/", "/wiki/").replace("http://", "https://")
+            rec = _rec(item, "wikidata.org", site, anchor, "wikidata_old",
+                       follow="", reason=f"former official site, {links} Wikipedia articles")
+            if rec and rec["target_domain"] not in seen:
+                seen.add(rec["target_domain"])
+                out.append(rec)
+        log(f"  Wikidata former official websites ({kind}): {len(out) - n0} domains")
+        time.sleep(1.5)
+    return out
+
+
+# ---- the old hand-edited web directory (DMOZ) ------------------------------------------------------
+DMOZ_DUMPS = [
+    "https://web.archive.org/web/2017id_/http://rdf.dmoz.org/rdf/content.rdf.u8.gz",
+    "https://web.archive.org/web/2016id_/http://rdf.dmoz.org/rdf/content.rdf.u8.gz",
+]
+DMOZ_SKIP = re.compile(r"^Top/(World|Regional|Adult|Kids_and_Teens|Test|Bookmarks)/")
+
+
+def dmoz_links(sample=3000, session=None, rng=random, log=lambda m: None, max_seconds=420, est_total=3_600_000):
+    """Random sites from the DMOZ directory dump. Every listing was vetted by a human editor, so these were
+    real sites that went on to collect links elsewhere; many have since lapsed. Source shown = the archived
+    DMOZ category page that listed the site."""
+    s = session or requests.Session()
+    s.headers["User-Agent"] = UA
+    p = min(1.0, sample * 1.3 / est_total)
+    t_end = time.time() + max_seconds
+    page_re = re.compile(rb'<ExternalPage about="([^"]+)"')
+    topic_re = re.compile(rb"<topic>([^<]+)</topic>")
+    title_re = re.compile(rb"<d:Title>([^<]*)</d:Title>")
+    for url in DMOZ_DUMPS:
+        try:
+            r = s.get(url, stream=True, timeout=(15, 60))
+            if r.status_code != 200:
+                log(f"  DMOZ dump {r.status_code} at {url[:60]}...")
+                continue
+            z = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            out, seen, buf, cur, total = [], set(), b"", None, 0
+            for chunk in r.iter_content(1 << 20):
+                buf += z.decompress(chunk)
+                lines = buf.split(b"\n")
+                buf = lines.pop()
+                for ln in lines:
+                    m = page_re.search(ln)
+                    if m:
+                        total += 1
+                        cur = {"url": m.group(1).decode("utf-8", "replace")} if rng.random() < p else None
+                        continue
+                    if cur is None:
+                        continue
+                    m = title_re.search(ln)
+                    if m:
+                        cur["title"] = htmllib.unescape(m.group(1).decode("utf-8", "replace"))
+                        continue
+                    m = topic_re.search(ln)
+                    if m:
+                        topic = m.group(1).decode("utf-8", "replace")
+                        if not DMOZ_SKIP.search(topic):
+                            src = "https://web.archive.org/web/2016/http://www.dmoz.org/" + quote(topic[4:]) + "/"
+                            rec = _rec(src, "dmoz.org", cur["url"], cur.get("title") or topic[4:].replace("/", " > "),
+                                       "dmoz", follow="", reason="listed in DMOZ")
+                            if rec and rec["target_domain"] not in seen:
+                                seen.add(rec["target_domain"])
+                                out.append(rec)
+                        cur = None
+                if len(out) >= sample or time.time() > t_end:
+                    break
+            r.close()
+            log(f"  DMOZ: read {total:,} listings, kept {len(out)} sites")
+            return out
+        except (requests.RequestException, zlib.error) as e:
+            log(f"  DMOZ dump failed: {type(e).__name__}")
+    return []
+
+
+# ---- "useful links" / resources pages on .gov, .edu and .ac.uk (Common Crawl URL index) -------------
+RESOURCE_DOMAINS = ["*.ac.uk", "*.edu", "*.gov", "*.gov.uk", "*.nhs.uk", "*.edu.au", "*.gc.ca", "*.org.uk"]
+RESOURCE_URL_RE = re.compile(r"(useful[-_]?links|/links?(\.html?|\.php|\.aspx?)?/?$|/resources?(\.html?|\.php)?/?$|"
+                             r"related[-_]?(sites|links)|external[-_]?links|web[-_]?links|other[-_]?sites|"
+                             r"recommended[-_]?(sites|links|websites)|link[-_]?library)", re.I)
+
+
+def cc_latest_index(session):
+    j = session.get("https://index.commoncrawl.org/collinfo.json", timeout=30).json()
+    return j[0]["cdx-api"]
+
+
+def resource_pages(domains=4, per_domain=30, session=None, rng=random, log=lambda m: None):
+    """URLs of links/resources pages on authoritative domains, from one random block of the Common Crawl index."""
+    s = session or requests.Session()
+    s.headers["User-Agent"] = UA
+    try:
+        api = cc_latest_index(s)
+    except (requests.RequestException, ValueError, KeyError, IndexError) as e:
+        log(f"  Common Crawl index list failed: {type(e).__name__}")
+        return []
+    out = []
+    for dom in rng.sample(RESOURCE_DOMAINS, min(domains, len(RESOURCE_DOMAINS))):
+        got = []
+        try:
+            n = int(s.get(api, timeout=40, params={"url": dom, "showNumPages": "true", "output": "json"})
+                    .json().get("pages", 0))
+            for pg in rng.sample(range(n), min(3, n)) if n else []:
+                r = s.get(api, timeout=60, params={"url": dom, "page": str(pg), "output": "json",
+                                                   "fl": "url,status,mime"})
+                for ln in r.text.splitlines():
+                    try:
+                        x = json.loads(ln)
+                    except ValueError:
+                        continue
+                    u = x.get("url", "")
+                    if x.get("status") == "200" and "html" in x.get("mime", "") and "?" not in u \
+                            and RESOURCE_URL_RE.search(urlparse(u).path or ""):
+                        got.append(u)
+                if len(set(got)) >= per_domain:
+                    break
+                time.sleep(1)
+        except (requests.RequestException, ValueError, TypeError) as e:
+            log(f"  Common Crawl index {dom}: {type(e).__name__}")
+        got = list(dict.fromkeys(got))
+        rng.shuffle(got)
+        log(f"  {dom}: {len(got)} links/resources pages")
+        out += got[:per_domain]
+    return out
+
+
+def resource_page_links(domains=4, per_domain=30, crawler=None, rng=random, log=lambda m: None):
+    crawler = crawler or Crawler(delay=1.0)
+    out = []
+    for u in resource_pages(domains, per_domain, rng=rng, log=log):
+        res = crawler.get(u)
+        if res:
+            for rec in extract_links(res[0], res[2], res[1])[0]:
+                rec["via"] = "resources"
+                out.append(rec)
+    return out
+
+
 # ---- old articles on top publishers / government sites (via Wayback's URL index) ------------------
 AUTHORITY_SITES = [
     # (url prefix whose OLD pages are still live, years to sample)
@@ -996,7 +1166,13 @@ AUTHORITY_SITES = [
     ("www.gov.uk/government/news/", (2012, 2015)), ("www.ed.gov/", (2005, 2012)), ("www.epa.gov/", (2005, 2012)),
     ("www.mit.edu/", (2005, 2012)), ("news.mit.edu/20", (2010, 2014)), ("www.stanford.edu/", (2005, 2012)),
     ("www.harvard.edu/", (2005, 2012)), ("www.ox.ac.uk/", (2005, 2012)), ("www.ucl.ac.uk/", (2005, 2012)),
+    # press-release wires: syndicated product launches whose sites later died
+    ("www.prnewswire.com/news-releases/", (2009, 2014)), ("www.businesswire.com/news/home/20", (2008, 2014)),
+    ("www.prweb.com/releases/20", (2006, 2013)), ("www.marketwired.com/press-release/", (2010, 2015)),
+    ("www.globenewswire.com/news-release/20", (2010, 2015)),
 ]
+PRESS_PREFIXES = ("www.prnewswire.com", "www.businesswire.com", "www.prweb.com", "www.marketwired.com",
+                  "www.globenewswire.com")
 
 
 def _cdx_rows(j):
@@ -1052,7 +1228,10 @@ def wayback_old_urls(prefix, years, limit=40, session=None, rng=random, log=lamb
 def authority_old_pages(sites=8, per_site=40, crawler=None, rng=random, log=lambda m: None):
     """Dofollow outbound links on the OLD pages of top publishers and government/university sites."""
     crawler = crawler or Crawler(delay=1.0)
-    picks = rng.sample(AUTHORITY_SITES, min(sites, len(AUTHORITY_SITES)))
+    press = [x for x in AUTHORITY_SITES if x[0].startswith(PRESS_PREFIXES)]
+    other = [x for x in AUTHORITY_SITES if not x[0].startswith(PRESS_PREFIXES)]
+    k = min(len(press), max(1, sites // 3))
+    picks = rng.sample(press, k) + rng.sample(other, min(sites - k, len(other)))
     out = []
     sess = requests.Session()
     for prefix, years in picks:
@@ -1064,7 +1243,7 @@ def authority_old_pages(sites=8, per_site=40, crawler=None, rng=random, log=lamb
             res = crawler.get(u)
             if res:
                 for rec in extract_links(res[0], res[2], res[1])[0]:
-                    rec["via"] = "publishers"
+                    rec["via"] = "press" if prefix.startswith(PRESS_PREFIXES) else "publishers"
                     out.append(rec)
         log(f"  {prefix}: {len(urls)} old pages, {len(out) - n0} outbound links")
     return out
@@ -1454,7 +1633,7 @@ CSV_COLS = ["domain", "status", "quality", "score", "dofollow_sources", "nofollo
 def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categories=(), wiki_limit=300,
             github_query=None, github_limit=30, public_only=False, sitemaps=False, ranked_sites=(),
             deadline=None, hn_months=0, debian_sample=0, cordis_sample=0, rng=random, wikidata_types=0,
-            publisher_sites=0, log=lambda msg: None):
+            publisher_sites=0, wikidata_old=0, dmoz_sample=0, resource_domains=0, log=lambda msg: None):
     """Collect outbound link records from seeds, ranked sites' old pages, Wikipedia and GitHub."""
     crawler = Crawler(delay=delay, public_only=public_only, deadline=deadline)
     records = []
@@ -1516,10 +1695,23 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
                 recs = []
             log(f"  {len(recs)} dofollow links")
             records.extend(recs)
-    if publisher_sites and not crawler.expired():
-        log(f"Reading old articles on {publisher_sites} top publisher / government sites...")
+    def own_crawler(minutes):  # page-fetching sources get their own time slot, not what the ranked crawl left over
+        end = time.time() + minutes * 60
+        return Crawler(delay=delay, public_only=public_only, deadline=min(end, deadline) if deadline else end)
+
+    if resource_domains:
+        log(f"Reading 'useful links' / resources pages on {resource_domains} kinds of .gov/.edu/.ac.uk sites...")
         try:
-            recs = authority_old_pages(publisher_sites, crawler=crawler, rng=rng, log=log)
+            recs = resource_page_links(resource_domains, crawler=own_crawler(10), rng=rng, log=log)
+        except Exception as e:  # noqa: BLE001
+            log(f"  failed: {type(e).__name__}: {e}")
+            recs = []
+        log(f"  {len(recs)} links ({sum(r['follow'] == 'dofollow' for r in recs)} dofollow)")
+        records.extend(recs)
+    if publisher_sites:
+        log(f"Reading old articles on {publisher_sites} top publisher, press-release and government sites...")
+        try:
+            recs = authority_old_pages(publisher_sites, crawler=own_crawler(10), rng=rng, log=log)
         except Exception as e:  # noqa: BLE001
             log(f"  failed: {type(e).__name__}: {e}")
             recs = []
@@ -1534,6 +1726,22 @@ def harvest(seeds=(), depth=1, max_pages=30, delay=1.0, workers=8, wiki_categori
             log(f"  failed: {type(e).__name__}: {e}")
             recs = []
         log(f"  {len(recs)} official websites of closed organisations")
+        records.extend(recs)
+    if wikidata_old:
+        log("Reading former official websites of notable organisations from Wikidata...")
+        try:
+            recs = wikidata_old_websites(wikidata_old, rng=rng, log=log)
+        except Exception as e:  # noqa: BLE001
+            log(f"  failed: {type(e).__name__}: {e}")
+            recs = []
+        records.extend(recs)
+    if dmoz_sample:
+        log("Reading the DMOZ directory dump...")
+        try:
+            recs = dmoz_links(dmoz_sample, rng=rng, log=log)
+        except Exception as e:  # noqa: BLE001
+            log(f"  failed: {type(e).__name__}: {e}")
+            recs = []
         records.extend(recs)
     if github_query:
         log(f"Searching GitHub for '{github_query}'...")
@@ -1708,6 +1916,19 @@ def load_data(path):
         return {"domains": {}, "runs": []}
 
 
+WATCH_STATES = {"DEAD_SITE", "PARKED", "EXPIRING_SOON", "EXPIRED_GRACE", "REDEMPTION"}
+
+
+def note_drop(r, before, stamp):
+    """Mark a domain that moved closer to being registrable (e.g. dead site -> pending delete -> available)."""
+    after = r.get("status")
+    if before and after and before != after and before not in BUYABLE \
+            and (after in BUYABLE or PRIORITY.get(after, 99) < PRIORITY.get(before, 99)):
+        r["dropped_at"], r["prev_status"] = stamp, before
+        return 1
+    return 0
+
+
 def _merge(old, r, stamp):
     prev = old.get(r["domain"])
     r["first_seen"] = prev.get("first_seen", stamp) if prev else r.get("first_seen", stamp)
@@ -1716,6 +1937,10 @@ def _merge(old, r, stamp):
         if prev.get("score", 0) > r.get("score", 0):
             r["score"], r["sources"] = prev["score"], prev.get("sources", r.get("sources"))
             r["dofollow_sources"] = max(r.get("dofollow_sources", 0), prev.get("dofollow_sources", 0))
+        for k in ("dropped_at", "prev_status"):
+            if prev.get(k) and not r.get(k):
+                r[k] = prev[k]
+        note_drop(r, prev.get("status"), stamp)
         vias = {v for v in (prev.get("via", "") + "," + r.get("via", "")).split(",") if v}
         r["via"] = ",".join(sorted(vias))
         for k in ("wb_first", "wb_last", "wb_years", "wb_months", "opr", "ref_domains", "cc_rank", "cc_pr_rank",
@@ -1763,7 +1988,7 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
          wiki_months=2, wiki_limit=150, seeds_file="seeds.txt", opr_key=None, workers=24, max_keep=6000,
          seed=None, hn_months=4, debian_sample=1500, cordis_sample=1500, cc_ranks=True,
          sd_pages=0, majestic_batch=0, cc_batch=0, wayback_checks=150, wikidata_types=8,
-         publisher_sites=8, log=print):
+         publisher_sites=9, wikidata_old=3000, dmoz_sample=3000, resource_domains=4, watch_top=1500, log=print):
     """Fully automatic run.
     Authority-first: StableDomains quality drop feed, a rotating batch of the Majestic Million and of the
     Common Crawl ranking (DNS + registry checks), then link discovery (ranked sites, Hacker News, Debian,
@@ -1784,17 +2009,6 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     stamp = now_iso()
     by_source = defaultdict(int)
 
-    # 1. StableDomains quality feed
-    if sd_pages:
-        log("Reading the StableDomains quality drop feed...")
-        items = stabledomains_feed(sd_pages, sort="quality", log=log)
-        sd_rows = [sd_item_to_row(it) for it in items if it.get("status") in SD_STATUS and not it.get("spam")]
-        sd_rows = [r for r in sd_rows if r["domain"] and not RESTRICTED_RE.search(r["domain"])]
-        log(f"  {len(sd_rows)} quality-scored drops")
-        for r in sd_rows:
-            _merge(old, r, stamp)
-        by_source["stabledomains"] = len(sd_rows)
-
     def checkpoint(label):
         """Save progress so a run stopped by the time limit still keeps what it found."""
         try:
@@ -1805,6 +2019,44 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
             log(f"  (checkpoint saved after {label}: {len(old)} domains)")
         except (OSError, TypeError, ValueError) as e:
             log(f"  checkpoint failed: {e}")
+
+    def recheck(domains):
+        recs = status_check(domains, rdap_all=True,
+                            site_check=[d for d in domains if old[d].get("status") in ("PARKED", "DEAD_SITE")], log=log)
+        dropped = 0
+        for d, rec in recs.items():
+            r = old[d]
+            before = r.get("status")
+            if rec["status"] == "REGISTERED" and rec.get("registration") == "registered":
+                r["status"], r["taken_at"] = "TAKEN", stamp
+            elif rec["status"] == "REGISTERED":
+                r["last_checked"] = stamp
+            else:
+                r.update(status=rec["status"], expiry=rec.get("expiry", r.get("expiry", "")), dns=rec.get("dns", ""),
+                         site=rec.get("site", r.get("site", "")), last_checked=stamp)
+                dropped += note_drop(r, before, stamp)
+        if dropped:
+            log(f"  {dropped} watched domains just dropped or became available")
+        return recs
+
+    # 0. watch-and-pounce: registered-but-dying domains we already know are strong, checked first every run
+    watch = sorted((d for d, r in old.items() if r.get("status") in WATCH_STATES),
+                   key=lambda d: -(old[d].get("quality") or 0))[:watch_top]
+    if watch:
+        log(f"Watchlist: checking {len(watch)} dead-site / expiring domains for drops...")
+        recheck(watch)
+        checkpoint("watchlist")
+
+    # 1. StableDomains quality feed
+    if sd_pages:
+        log("Reading the StableDomains quality drop feed...")
+        items = stabledomains_feed(sd_pages, sort="quality", log=log)
+        sd_rows = [sd_item_to_row(it) for it in items if it.get("status") in SD_STATUS and not it.get("spam")]
+        sd_rows = [r for r in sd_rows if r["domain"] and not RESTRICTED_RE.search(r["domain"])]
+        log(f"  {len(sd_rows)} quality-scored drops")
+        for r in sd_rows:
+            _merge(old, r, stamp)
+        by_source["stabledomains"] = len(sd_rows)
 
     checkpoint("drop feed")
     # 2. Majestic Million batch
@@ -1832,8 +2084,10 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     records = [] if not time_left("link discovery") else harvest(my_seeds, sitemaps=True, ranked_sites=ranked, wiki_categories=cats, wiki_limit=wiki_limit,
                       workers=workers, deadline=deadline, hn_months=hn_months, debian_sample=debian_sample,
                       cordis_sample=cordis_sample, rng=rng, wikidata_types=wikidata_types,
-                      publisher_sites=publisher_sites, log=log)
-    for v in ("crawl", "wikipedia", "hackernews", "debian", "cordis", "wikidata", "publishers"):
+                      publisher_sites=publisher_sites, wikidata_old=wikidata_old, dmoz_sample=dmoz_sample,
+                      resource_domains=resource_domains, log=log)
+    for v in ("crawl", "wikipedia", "hackernews", "debian", "cordis", "wikidata", "publishers", "wikidata_old",
+              "dmoz", "resources", "press"):
         by_source[v + "_links"] = sum(1 for r in records if r.get("via") == v)
     log(f"Harvested {len(records)} links ({sum(r['follow'] == 'dofollow' for r in records)} dofollow) "
         f"to {len({r['target_domain'] for r in records})} domains.")
@@ -1848,17 +2102,7 @@ def hunt(data_path="data/candidates.json", csv_path="data/latest.csv", budget_mi
     stale = [d for d, r in old.items() if d not in fresh_stamp and r.get("status") != "TAKEN"]
     if stale and time_left("re-checks"):
         log(f"Re-checking {len(stale)} domains from earlier runs...")
-        recs = status_check(stale, rdap_all=True,
-                            site_check=[d for d in stale if old[d].get("status") in ("PARKED", "DEAD_SITE")], log=log)
-        for d, rec in recs.items():
-            r = old[d]
-            if rec["status"] == "REGISTERED" and rec.get("registration") == "registered":
-                r["status"], r["taken_at"] = "TAKEN", stamp
-            elif rec["status"] == "REGISTERED":
-                r["last_checked"] = stamp
-            else:
-                r.update(status=rec["status"], expiry=rec.get("expiry", r.get("expiry", "")), dns=rec.get("dns", ""),
-                         site=rec.get("site", r.get("site", "")), last_checked=stamp)
+        recheck(stale)
 
     # 5. Common Crawl: authority for every candidate + a rotating window of top-ranked domains to scan
     if cc_ranks and time_left("Common Crawl"):
@@ -1994,7 +2238,8 @@ def cmd_hunt(a):
          os.environ.get("OPR_API_KEY"), a.workers, seed=a.random_seed, hn_months=a.hn_months,
          debian_sample=a.debian, cordis_sample=a.cordis, cc_ranks=not a.no_cc_ranks, sd_pages=a.sd_pages,
          majestic_batch=a.majestic, cc_batch=a.cc_batch, wayback_checks=a.wayback_checks,
-         wikidata_types=a.wikidata_types, publisher_sites=a.publishers,
+         wikidata_types=a.wikidata_types, publisher_sites=a.publishers, wikidata_old=a.wikidata_old,
+         dmoz_sample=a.dmoz, resource_domains=a.resources,
          log=lambda m: print(m, flush=True))
 
 
@@ -2113,7 +2358,10 @@ def main():
     k.add_argument("--cc-batch", type=int, default=0, help="top Common Crawl domains to DNS-scan per run")
     k.add_argument("--wayback-checks", type=int, default=150, help="candidates to verify in the Wayback Machine")
     k.add_argument("--wikidata-types", type=int, default=8, help="random kinds of defunct organisations to read")
-    k.add_argument("--publishers", type=int, default=8, help="top publisher / gov sites whose old pages to read")
+    k.add_argument("--wikidata-old", type=int, default=3000, help="former official websites to read from Wikidata")
+    k.add_argument("--dmoz", type=int, default=3000, help="random DMOZ directory listings to check")
+    k.add_argument("--resources", type=int, default=4, help="kinds of .gov/.edu domains whose links pages to read")
+    k.add_argument("--publishers", type=int, default=9, help="top publisher / gov sites whose old pages to read")
     k.add_argument("--workers", type=int, default=24)
     k.add_argument("--random-seed", type=int)
     k.set_defaults(fn=cmd_hunt)
